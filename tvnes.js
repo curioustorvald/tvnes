@@ -27,7 +27,7 @@ e.fNeg = false // negative flag
 
 // helper functions
 
-// increment PC by 1 with wrapping
+// change PC by offset with wrapping
 e.movPC = (offset) => {
     e.pc = e.pc + offset
     while (e.pc > 65535) {
@@ -37,15 +37,30 @@ e.movPC = (offset) => {
         e.pc += 65536
     }
 }
-e.incPC = () => { e.pc = (e.pc + 1) % 65536 }
-e.decPC = () => { e.pc = (e.pc == 0) ? 65535 : e.pc = e.pc - 1 }
-// read a byte from index PC then increment PC
-e.readPC = () => { const v = read(e.pc); e.incPC(); return v }
-e.readPCs = () => { const v = readSigned(e.pc); e.incPC(); return v }
-// read an ushort from index PC then increment PC twice
+// increment PC by 1 with wrapping
+e.incPC = () => { let pc = e.pc; e.pc = (pc + 1) % 65536 }
+// decrement PC by 1 with wrapping
+e.decPC = () => { let pc = e.pc; e.pc = (pc == 0) ? 65535 : pc - 1 }
+// read a byte from index PC then increment PC atomically
+e.readPC = () => {
+    let pc = e.pc // capture the value
+    const v = read(pc)
+    e.pc = (pc + 1) % 65536
+    return v
+}
+// read a signed byte from index PC then increment PC atomically
+e.readPCs = () => {
+    let pc = e.pc // capture the value
+    const v = readSigned(pc)
+    e.pc = (pc + 1) % 65536
+    return v
+}
+// read an ushort from index PC then increment PC twice atomically
 e.readPCu16 = () => {
-    const lo = e.readPC()
-    const hi = e.readPC()
+    let pc = e.pc // capture the value
+    const lo = read(pc)
+    const hi = read(pc+1)
+    e.pc = (pc + 2) % 65536
     return (hi << 8) | lo
 }
 
