@@ -1,0 +1,41 @@
+$FFFF	--		RESET			A:00	X:00	Y:00	SP:00	nv--dizc	Cycle: 0	PPU_cycle: 7 (0, 7)		VRAMAddress:0000	PPUReadBuffer:00
+$8000	A9 3F 		LDA #3F			A:00	X:00	Y:00	SP:FD	nv--dIzc	Cycle: 7	PPU_cycle: 28 (0, 28)		VRAMAddress:0000	PPUReadBuffer:00
+$8002	8D 06 20 	STA $2006		A:3F	X:00	Y:00	SP:FD	nv--dIzc	Cycle: 9	PPU_cycle: 34 (0, 34)		VRAMAddress:0000	PPUReadBuffer:00
+$8005	A9 00 		LDA #00			A:3F	X:00	Y:00	SP:FD	nv--dIzc	Cycle: 13	PPU_cycle: 46 (0, 46)		VRAMAddress:0000	PPUReadBuffer:00
+$8007	8D 06 20 	STA $2006		A:00	X:00	Y:00	SP:FD	nv--dIZc	Cycle: 15	PPU_cycle: 52 (0, 52)		VRAMAddress:0000	PPUReadBuffer:00
+$800A	A9 0F 		LDA #0F			A:00	X:00	Y:00	SP:FD	nv--dIZc	Cycle: 19	PPU_cycle: 64 (0, 64)		VRAMAddress:0000	PPUReadBuffer:00
+$800C	8D 07 20 	STA $2007 | PPU[$3F00]	A:0F	X:00	Y:00	SP:FD	nv--dIzc	Cycle: 21	PPU_cycle: 70 (0, 70)		VRAMAddress:3F00	PPUReadBuffer:00
+$800F	A9 00 		LDA #00			A:0F	X:00	Y:00	SP:FD	nv--dIzc	Cycle: 25	PPU_cycle: 82 (0, 82)		VRAMAddress:3F01	PPUReadBuffer:00
+$8011	8D 07 20 	STA $2007 | PPU[$3F01]	A:00	X:00	Y:00	SP:FD	nv--dIZc	Cycle: 27	PPU_cycle: 88 (0, 88)		VRAMAddress:3F01	PPUReadBuffer:00
+$8014	A9 10 		LDA #10			A:00	X:00	Y:00	SP:FD	nv--dIZc	Cycle: 31	PPU_cycle: 100 (0, 100)		VRAMAddress:3F02	PPUReadBuffer:00
+$8016	8D 07 20 	STA $2007 | PPU[$3F02]	A:10	X:00	Y:00	SP:FD	nv--dIzc	Cycle: 33	PPU_cycle: 106 (0, 106)		VRAMAddress:3F02	PPUReadBuffer:00
+$8019	A9 30 		LDA #30			A:10	X:00	Y:00	SP:FD	nv--dIzc	Cycle: 37	PPU_cycle: 118 (0, 118)		VRAMAddress:3F03	PPUReadBuffer:00
+$801B	8D 07 20 	STA $2007 | PPU[$3F03]	A:30	X:00	Y:00	SP:FD	nv--dIzc	Cycle: 39	PPU_cycle: 124 (0, 124)		VRAMAddress:3F03	PPUReadBuffer:00
+$801E	A9 20 		LDA #20			A:30	X:00	Y:00	SP:FD	nv--dIzc	Cycle: 43	PPU_cycle: 136 (0, 136)		VRAMAddress:3F04	PPUReadBuffer:00
+$8020	8D 06 20 	STA $2006		A:20	X:00	Y:00	SP:FD	nv--dIzc	Cycle: 45	PPU_cycle: 142 (0, 142)		VRAMAddress:3F04	PPUReadBuffer:00
+$8023	A9 00 		LDA #00			A:20	X:00	Y:00	SP:FD	nv--dIzc	Cycle: 49	PPU_cycle: 154 (0, 154)		VRAMAddress:3F04	PPUReadBuffer:00
+$8025	8D 06 20 	STA $2006		A:00	X:00	Y:00	SP:FD	nv--dIZc	Cycle: 51	PPU_cycle: 160 (0, 160)		VRAMAddress:3F04	PPUReadBuffer:00
+$8028	A9 11 		LDA #11			A:00	X:00	Y:00	SP:FD	nv--dIZc	Cycle: 55	PPU_cycle: 172 (0, 172)		VRAMAddress:2000	PPUReadBuffer:00
+$802A	8D 07 20 	STA $2007 | PPU[$2000]	A:11	X:00	Y:00	SP:FD	nv--dIzc	Cycle: 57	PPU_cycle: 178 (0, 178)		VRAMAddress:2000	PPUReadBuffer:00
+$802D	A9 0E 		LDA #0E			A:11	X:00	Y:00	SP:FD	nv--dIzc	Cycle: 61	PPU_cycle: 190 (0, 190)		VRAMAddress:2001	PPUReadBuffer:00
+$802F	8D 07 20 	STA $2007 | PPU[$2001]	A:0E	X:00	Y:00	SP:FD	nv--dIzc	Cycle: 63	PPU_cycle: 196 (0, 196)		VRAMAddress:2001	PPUReadBuffer:00
+$8032	A9 15 		LDA #15			A:0E	X:00	Y:00	SP:FD	nv--dIzc	Cycle: 67	PPU_cycle: 208 (0, 208)		VRAMAddress:2002	PPUReadBuffer:00
+$8034	8D 07 20 	STA $2007 | PPU[$2002]	A:15	X:00	Y:00	SP:FD	nv--dIzc	Cycle: 69	PPU_cycle: 214 (0, 214)		VRAMAddress:2002	PPUReadBuffer:00
+$8037	8D 07 20 	STA $2007 | PPU[$2003]	A:15	X:00	Y:00	SP:FD	nv--dIzc	Cycle: 73	PPU_cycle: 226 (0, 226)		VRAMAddress:2003	PPUReadBuffer:00
+$803A	A9 18 		LDA #18			A:15	X:00	Y:00	SP:FD	nv--dIzc	Cycle: 77	PPU_cycle: 238 (0, 238)		VRAMAddress:2004	PPUReadBuffer:00
+$803C	8D 07 20 	STA $2007 | PPU[$2004]	A:18	X:00	Y:00	SP:FD	nv--dIzc	Cycle: 79	PPU_cycle: 244 (0, 244)		VRAMAddress:2004	PPUReadBuffer:00
+$803F	A9 24 		LDA #24			A:18	X:00	Y:00	SP:FD	nv--dIzc	Cycle: 83	PPU_cycle: 256 (0, 256)		VRAMAddress:2005	PPUReadBuffer:00
+$8041	8D 07 20 	STA $2007 | PPU[$2005]	A:24	X:00	Y:00	SP:FD	nv--dIzc	Cycle: 85	PPU_cycle: 262 (0, 262)		VRAMAddress:2005	PPUReadBuffer:00
+$8044	A9 20 		LDA #20			A:24	X:00	Y:00	SP:FD	nv--dIzc	Cycle: 89	PPU_cycle: 274 (0, 274)		VRAMAddress:2006	PPUReadBuffer:00
+$8046	8D 07 20 	STA $2007 | PPU[$2006]	A:20	X:00	Y:00	SP:FD	nv--dIzc	Cycle: 91	PPU_cycle: 280 (0, 280)		VRAMAddress:2006	PPUReadBuffer:00
+$8049	A9 18 		LDA #18			A:20	X:00	Y:00	SP:FD	nv--dIzc	Cycle: 95	PPU_cycle: 292 (0, 292)		VRAMAddress:2007	PPUReadBuffer:00
+$804B	8D 07 20 	STA $2007 | PPU[$2007]	A:18	X:00	Y:00	SP:FD	nv--dIzc	Cycle: 97	PPU_cycle: 298 (0, 298)		VRAMAddress:2007	PPUReadBuffer:00
+$804E	A9 1B 		LDA #1B			A:18	X:00	Y:00	SP:FD	nv--dIzc	Cycle: 101	PPU_cycle: 310 (0, 310)		VRAMAddress:2008	PPUReadBuffer:00
+$8050	8D 07 20 	STA $2007 | PPU[$2008]	A:1B	X:00	Y:00	SP:FD	nv--dIzc	Cycle: 103	PPU_cycle: 316 (0, 316)		VRAMAddress:2008	PPUReadBuffer:00
+$8053	A9 15 		LDA #15			A:1B	X:00	Y:00	SP:FD	nv--dIzc	Cycle: 107	PPU_cycle: 328 (0, 328)		VRAMAddress:2009	PPUReadBuffer:00
+$8055	8D 07 20 	STA $2007 | PPU[$2009]	A:15	X:00	Y:00	SP:FD	nv--dIzc	Cycle: 109	PPU_cycle: 334 (0, 334)		VRAMAddress:2009	PPUReadBuffer:00
+$8058	A9 0D 		LDA #0D			A:15	X:00	Y:00	SP:FD	nv--dIzc	Cycle: 113	PPU_cycle: 346 (1, 5)		VRAMAddress:200A	PPUReadBuffer:00
+$805A	8D 07 20 	STA $2007 | PPU[$200A]	A:0D	X:00	Y:00	SP:FD	nv--dIzc	Cycle: 115	PPU_cycle: 352 (1, 11)		VRAMAddress:200A	PPUReadBuffer:00
+$805D	A9 26 		LDA #26			A:0D	X:00	Y:00	SP:FD	nv--dIzc	Cycle: 119	PPU_cycle: 364 (1, 23)		VRAMAddress:200B	PPUReadBuffer:00
+$805F	8D 07 20 	STA $2007 | PPU[$200B]	A:26	X:00	Y:00	SP:FD	nv--dIzc	Cycle: 121	PPU_cycle: 370 (1, 29)		VRAMAddress:200B	PPUReadBuffer:00
+$8062	02 		HLT 			A:26	X:00	Y:00	SP:FD	nv--dIzc	Cycle: 125	PPU_cycle: 382 (1, 41)		VRAMAddress:200C	PPUReadBuffer:00

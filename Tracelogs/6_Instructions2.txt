@@ -1,0 +1,232 @@
+$FFFF	--		RESET			A:00	X:00	Y:00	SP:00	nv--dizc	Cycle: 0
+$8000	A9 01 		LDA #01			A:00	X:00	Y:00	SP:FD	nv--dIzc	Cycle: 7
+$8002	A2 00 		LDX #00			A:01	X:00	Y:00	SP:FD	nv--dIzc	Cycle: 9
+$8004	95 00 		STA <$00, X -> $00	A:01	X:00	Y:00	SP:FD	nv--dIZc	Cycle: 11
+$8006	E8 		INX 			A:01	X:00	Y:00	SP:FD	nv--dIZc	Cycle: 15
+$8007	95 00 		STA <$00, X -> $01	A:01	X:01	Y:00	SP:FD	nv--dIzc	Cycle: 17
+$8009	A2 00 		LDX #00			A:01	X:01	Y:00	SP:FD	nv--dIzc	Cycle: 21
+$800B	B5 00 		LDA <$00, X -> $00	A:01	X:00	Y:00	SP:FD	nv--dIZc	Cycle: 23
+$800D	18 		CLC 			A:01	X:00	Y:00	SP:FD	nv--dIzc	Cycle: 27
+$800E	75 01 		ADC <$01, X -> $01	A:01	X:00	Y:00	SP:FD	nv--dIzc	Cycle: 29
+$8010	95 02 		STA <$02, X -> $02	A:02	X:00	Y:00	SP:FD	nv--dIzc	Cycle: 33
+$8012	E8 		INX 			A:02	X:00	Y:00	SP:FD	nv--dIzc	Cycle: 37
+$8013	E0 0B 		CPX #0B			A:02	X:01	Y:00	SP:FD	nv--dIzc	Cycle: 39
+$8015	D0 F4 		BNE $800B		A:02	X:01	Y:00	SP:FD	Nv--dIzc	Cycle: 41
+$800B	B5 00 		LDA <$00, X -> $01	A:02	X:01	Y:00	SP:FD	Nv--dIzc	Cycle: 44
+$800D	18 		CLC 			A:01	X:01	Y:00	SP:FD	nv--dIzc	Cycle: 48
+$800E	75 01 		ADC <$01, X -> $02	A:01	X:01	Y:00	SP:FD	nv--dIzc	Cycle: 50
+$8010	95 02 		STA <$02, X -> $03	A:03	X:01	Y:00	SP:FD	nv--dIzc	Cycle: 54
+$8012	E8 		INX 			A:03	X:01	Y:00	SP:FD	nv--dIzc	Cycle: 58
+$8013	E0 0B 		CPX #0B			A:03	X:02	Y:00	SP:FD	nv--dIzc	Cycle: 60
+$8015	D0 F4 		BNE $800B		A:03	X:02	Y:00	SP:FD	Nv--dIzc	Cycle: 62
+$800B	B5 00 		LDA <$00, X -> $02	A:03	X:02	Y:00	SP:FD	Nv--dIzc	Cycle: 65
+$800D	18 		CLC 			A:02	X:02	Y:00	SP:FD	nv--dIzc	Cycle: 69
+$800E	75 01 		ADC <$01, X -> $03	A:02	X:02	Y:00	SP:FD	nv--dIzc	Cycle: 71
+$8010	95 02 		STA <$02, X -> $04	A:05	X:02	Y:00	SP:FD	nv--dIzc	Cycle: 75
+$8012	E8 		INX 			A:05	X:02	Y:00	SP:FD	nv--dIzc	Cycle: 79
+$8013	E0 0B 		CPX #0B			A:05	X:03	Y:00	SP:FD	nv--dIzc	Cycle: 81
+$8015	D0 F4 		BNE $800B		A:05	X:03	Y:00	SP:FD	Nv--dIzc	Cycle: 83
+$800B	B5 00 		LDA <$00, X -> $03	A:05	X:03	Y:00	SP:FD	Nv--dIzc	Cycle: 86
+$800D	18 		CLC 			A:03	X:03	Y:00	SP:FD	nv--dIzc	Cycle: 90
+$800E	75 01 		ADC <$01, X -> $04	A:03	X:03	Y:00	SP:FD	nv--dIzc	Cycle: 92
+$8010	95 02 		STA <$02, X -> $05	A:08	X:03	Y:00	SP:FD	nv--dIzc	Cycle: 96
+$8012	E8 		INX 			A:08	X:03	Y:00	SP:FD	nv--dIzc	Cycle: 100
+$8013	E0 0B 		CPX #0B			A:08	X:04	Y:00	SP:FD	nv--dIzc	Cycle: 102
+$8015	D0 F4 		BNE $800B		A:08	X:04	Y:00	SP:FD	Nv--dIzc	Cycle: 104
+$800B	B5 00 		LDA <$00, X -> $04	A:08	X:04	Y:00	SP:FD	Nv--dIzc	Cycle: 107
+$800D	18 		CLC 			A:05	X:04	Y:00	SP:FD	nv--dIzc	Cycle: 111
+$800E	75 01 		ADC <$01, X -> $05	A:05	X:04	Y:00	SP:FD	nv--dIzc	Cycle: 113
+$8010	95 02 		STA <$02, X -> $06	A:0D	X:04	Y:00	SP:FD	nv--dIzc	Cycle: 117
+$8012	E8 		INX 			A:0D	X:04	Y:00	SP:FD	nv--dIzc	Cycle: 121
+$8013	E0 0B 		CPX #0B			A:0D	X:05	Y:00	SP:FD	nv--dIzc	Cycle: 123
+$8015	D0 F4 		BNE $800B		A:0D	X:05	Y:00	SP:FD	Nv--dIzc	Cycle: 125
+$800B	B5 00 		LDA <$00, X -> $05	A:0D	X:05	Y:00	SP:FD	Nv--dIzc	Cycle: 128
+$800D	18 		CLC 			A:08	X:05	Y:00	SP:FD	nv--dIzc	Cycle: 132
+$800E	75 01 		ADC <$01, X -> $06	A:08	X:05	Y:00	SP:FD	nv--dIzc	Cycle: 134
+$8010	95 02 		STA <$02, X -> $07	A:15	X:05	Y:00	SP:FD	nv--dIzc	Cycle: 138
+$8012	E8 		INX 			A:15	X:05	Y:00	SP:FD	nv--dIzc	Cycle: 142
+$8013	E0 0B 		CPX #0B			A:15	X:06	Y:00	SP:FD	nv--dIzc	Cycle: 144
+$8015	D0 F4 		BNE $800B		A:15	X:06	Y:00	SP:FD	Nv--dIzc	Cycle: 146
+$800B	B5 00 		LDA <$00, X -> $06	A:15	X:06	Y:00	SP:FD	Nv--dIzc	Cycle: 149
+$800D	18 		CLC 			A:0D	X:06	Y:00	SP:FD	nv--dIzc	Cycle: 153
+$800E	75 01 		ADC <$01, X -> $07	A:0D	X:06	Y:00	SP:FD	nv--dIzc	Cycle: 155
+$8010	95 02 		STA <$02, X -> $08	A:22	X:06	Y:00	SP:FD	nv--dIzc	Cycle: 159
+$8012	E8 		INX 			A:22	X:06	Y:00	SP:FD	nv--dIzc	Cycle: 163
+$8013	E0 0B 		CPX #0B			A:22	X:07	Y:00	SP:FD	nv--dIzc	Cycle: 165
+$8015	D0 F4 		BNE $800B		A:22	X:07	Y:00	SP:FD	Nv--dIzc	Cycle: 167
+$800B	B5 00 		LDA <$00, X -> $07	A:22	X:07	Y:00	SP:FD	Nv--dIzc	Cycle: 170
+$800D	18 		CLC 			A:15	X:07	Y:00	SP:FD	nv--dIzc	Cycle: 174
+$800E	75 01 		ADC <$01, X -> $08	A:15	X:07	Y:00	SP:FD	nv--dIzc	Cycle: 176
+$8010	95 02 		STA <$02, X -> $09	A:37	X:07	Y:00	SP:FD	nv--dIzc	Cycle: 180
+$8012	E8 		INX 			A:37	X:07	Y:00	SP:FD	nv--dIzc	Cycle: 184
+$8013	E0 0B 		CPX #0B			A:37	X:08	Y:00	SP:FD	nv--dIzc	Cycle: 186
+$8015	D0 F4 		BNE $800B		A:37	X:08	Y:00	SP:FD	Nv--dIzc	Cycle: 188
+$800B	B5 00 		LDA <$00, X -> $08	A:37	X:08	Y:00	SP:FD	Nv--dIzc	Cycle: 191
+$800D	18 		CLC 			A:22	X:08	Y:00	SP:FD	nv--dIzc	Cycle: 195
+$800E	75 01 		ADC <$01, X -> $09	A:22	X:08	Y:00	SP:FD	nv--dIzc	Cycle: 197
+$8010	95 02 		STA <$02, X -> $0A	A:59	X:08	Y:00	SP:FD	nv--dIzc	Cycle: 201
+$8012	E8 		INX 			A:59	X:08	Y:00	SP:FD	nv--dIzc	Cycle: 205
+$8013	E0 0B 		CPX #0B			A:59	X:09	Y:00	SP:FD	nv--dIzc	Cycle: 207
+$8015	D0 F4 		BNE $800B		A:59	X:09	Y:00	SP:FD	Nv--dIzc	Cycle: 209
+$800B	B5 00 		LDA <$00, X -> $09	A:59	X:09	Y:00	SP:FD	Nv--dIzc	Cycle: 212
+$800D	18 		CLC 			A:37	X:09	Y:00	SP:FD	nv--dIzc	Cycle: 216
+$800E	75 01 		ADC <$01, X -> $0A	A:37	X:09	Y:00	SP:FD	nv--dIzc	Cycle: 218
+$8010	95 02 		STA <$02, X -> $0B	A:90	X:09	Y:00	SP:FD	NV--dIzc	Cycle: 222
+$8012	E8 		INX 			A:90	X:09	Y:00	SP:FD	NV--dIzc	Cycle: 226
+$8013	E0 0B 		CPX #0B			A:90	X:0A	Y:00	SP:FD	nV--dIzc	Cycle: 228
+$8015	D0 F4 		BNE $800B		A:90	X:0A	Y:00	SP:FD	NV--dIzc	Cycle: 230
+$800B	B5 00 		LDA <$00, X -> $0A	A:90	X:0A	Y:00	SP:FD	NV--dIzc	Cycle: 233
+$800D	18 		CLC 			A:59	X:0A	Y:00	SP:FD	nV--dIzc	Cycle: 237
+$800E	75 01 		ADC <$01, X -> $0B	A:59	X:0A	Y:00	SP:FD	nV--dIzc	Cycle: 239
+$8010	95 02 		STA <$02, X -> $0C	A:E9	X:0A	Y:00	SP:FD	Nv--dIzc	Cycle: 243
+$8012	E8 		INX 			A:E9	X:0A	Y:00	SP:FD	Nv--dIzc	Cycle: 247
+$8013	E0 0B 		CPX #0B			A:E9	X:0B	Y:00	SP:FD	nv--dIzc	Cycle: 249
+$8015	D0 F4 		BNE $800B		A:E9	X:0B	Y:00	SP:FD	nv--dIZC	Cycle: 251
+$8017	4C 26 80 	JMP $8026		A:E9	X:0B	Y:00	SP:FD	nv--dIZC	Cycle: 253
+$8026	A2 0B 		LDX #0B			A:E9	X:0B	Y:00	SP:FD	nv--dIZC	Cycle: 256
+$8028	BD 1A 80 	LDA $801A, X -> $8025	A:E9	X:0B	Y:00	SP:FD	nv--dIzC	Cycle: 258
+$802B	95 10 		STA <$10, X -> $1B	A:21	X:0B	Y:00	SP:FD	nv--dIzC	Cycle: 262
+$802D	CA 		DEX 			A:21	X:0B	Y:00	SP:FD	nv--dIzC	Cycle: 266
+$802E	10 F8 		BPL $8028		A:21	X:0A	Y:00	SP:FD	nv--dIzC	Cycle: 268
+$8028	BD 1A 80 	LDA $801A, X -> $8024	A:21	X:0A	Y:00	SP:FD	nv--dIzC	Cycle: 271
+$802B	95 10 		STA <$10, X -> $1A	A:64	X:0A	Y:00	SP:FD	nv--dIzC	Cycle: 275
+$802D	CA 		DEX 			A:64	X:0A	Y:00	SP:FD	nv--dIzC	Cycle: 279
+$802E	10 F8 		BPL $8028		A:64	X:09	Y:00	SP:FD	nv--dIzC	Cycle: 281
+$8028	BD 1A 80 	LDA $801A, X -> $8023	A:64	X:09	Y:00	SP:FD	nv--dIzC	Cycle: 284
+$802B	95 10 		STA <$10, X -> $19	A:6C	X:09	Y:00	SP:FD	nv--dIzC	Cycle: 288
+$802D	CA 		DEX 			A:6C	X:09	Y:00	SP:FD	nv--dIzC	Cycle: 292
+$802E	10 F8 		BPL $8028		A:6C	X:08	Y:00	SP:FD	nv--dIzC	Cycle: 294
+$8028	BD 1A 80 	LDA $801A, X -> $8022	A:6C	X:08	Y:00	SP:FD	nv--dIzC	Cycle: 297
+$802B	95 10 		STA <$10, X -> $18	A:72	X:08	Y:00	SP:FD	nv--dIzC	Cycle: 301
+$802D	CA 		DEX 			A:72	X:08	Y:00	SP:FD	nv--dIzC	Cycle: 305
+$802E	10 F8 		BPL $8028		A:72	X:07	Y:00	SP:FD	nv--dIzC	Cycle: 307
+$8028	BD 1A 80 	LDA $801A, X -> $8021	A:72	X:07	Y:00	SP:FD	nv--dIzC	Cycle: 310
+$802B	95 10 		STA <$10, X -> $17	A:6F	X:07	Y:00	SP:FD	nv--dIzC	Cycle: 314
+$802D	CA 		DEX 			A:6F	X:07	Y:00	SP:FD	nv--dIzC	Cycle: 318
+$802E	10 F8 		BPL $8028		A:6F	X:06	Y:00	SP:FD	nv--dIzC	Cycle: 320
+$8028	BD 1A 80 	LDA $801A, X -> $8020	A:6F	X:06	Y:00	SP:FD	nv--dIzC	Cycle: 323
+$802B	95 10 		STA <$10, X -> $16	A:77	X:06	Y:00	SP:FD	nv--dIzC	Cycle: 327
+$802D	CA 		DEX 			A:77	X:06	Y:00	SP:FD	nv--dIzC	Cycle: 331
+$802E	10 F8 		BPL $8028		A:77	X:05	Y:00	SP:FD	nv--dIzC	Cycle: 333
+$8028	BD 1A 80 	LDA $801A, X -> $801F	A:77	X:05	Y:00	SP:FD	nv--dIzC	Cycle: 336
+$802B	95 10 		STA <$10, X -> $15	A:20	X:05	Y:00	SP:FD	nv--dIzC	Cycle: 340
+$802D	CA 		DEX 			A:20	X:05	Y:00	SP:FD	nv--dIzC	Cycle: 344
+$802E	10 F8 		BPL $8028		A:20	X:04	Y:00	SP:FD	nv--dIzC	Cycle: 346
+$8028	BD 1A 80 	LDA $801A, X -> $801E	A:20	X:04	Y:00	SP:FD	nv--dIzC	Cycle: 349
+$802B	95 10 		STA <$10, X -> $14	A:6F	X:04	Y:00	SP:FD	nv--dIzC	Cycle: 353
+$802D	CA 		DEX 			A:6F	X:04	Y:00	SP:FD	nv--dIzC	Cycle: 357
+$802E	10 F8 		BPL $8028		A:6F	X:03	Y:00	SP:FD	nv--dIzC	Cycle: 359
+$8028	BD 1A 80 	LDA $801A, X -> $801D	A:6F	X:03	Y:00	SP:FD	nv--dIzC	Cycle: 362
+$802B	95 10 		STA <$10, X -> $13	A:6C	X:03	Y:00	SP:FD	nv--dIzC	Cycle: 366
+$802D	CA 		DEX 			A:6C	X:03	Y:00	SP:FD	nv--dIzC	Cycle: 370
+$802E	10 F8 		BPL $8028		A:6C	X:02	Y:00	SP:FD	nv--dIzC	Cycle: 372
+$8028	BD 1A 80 	LDA $801A, X -> $801C	A:6C	X:02	Y:00	SP:FD	nv--dIzC	Cycle: 375
+$802B	95 10 		STA <$10, X -> $12	A:6C	X:02	Y:00	SP:FD	nv--dIzC	Cycle: 379
+$802D	CA 		DEX 			A:6C	X:02	Y:00	SP:FD	nv--dIzC	Cycle: 383
+$802E	10 F8 		BPL $8028		A:6C	X:01	Y:00	SP:FD	nv--dIzC	Cycle: 385
+$8028	BD 1A 80 	LDA $801A, X -> $801B	A:6C	X:01	Y:00	SP:FD	nv--dIzC	Cycle: 388
+$802B	95 10 		STA <$10, X -> $11	A:65	X:01	Y:00	SP:FD	nv--dIzC	Cycle: 392
+$802D	CA 		DEX 			A:65	X:01	Y:00	SP:FD	nv--dIzC	Cycle: 396
+$802E	10 F8 		BPL $8028		A:65	X:00	Y:00	SP:FD	nv--dIZC	Cycle: 398
+$8028	BD 1A 80 	LDA $801A, X -> $801A	A:65	X:00	Y:00	SP:FD	nv--dIZC	Cycle: 401
+$802B	95 10 		STA <$10, X -> $10	A:48	X:00	Y:00	SP:FD	nv--dIzC	Cycle: 405
+$802D	CA 		DEX 			A:48	X:00	Y:00	SP:FD	nv--dIzC	Cycle: 409
+$802E	10 F8 		BPL $8028		A:48	X:FF	Y:00	SP:FD	Nv--dIzC	Cycle: 411
+$8030	A9 00 		LDA #00			A:48	X:FF	Y:00	SP:FD	Nv--dIzC	Cycle: 413
+$8032	85 FF 		STA <$FF		A:00	X:FF	Y:00	SP:FD	nv--dIZC	Cycle: 415
+$8034	A9 20 		LDA #20			A:00	X:FF	Y:00	SP:FD	nv--dIZC	Cycle: 418
+$8036	85 FE 		STA <$FE		A:20	X:FF	Y:00	SP:FD	nv--dIzC	Cycle: 420
+$8038	A0 00 		LDY #00			A:20	X:FF	Y:00	SP:FD	nv--dIzC	Cycle: 423
+$803A	98 		TYA 			A:20	X:FF	Y:00	SP:FD	nv--dIZC	Cycle: 425
+$803B	91 FE 		STA ($00FE), Y -> $0020	A:00	X:FF	Y:00	SP:FD	nv--dIZC	Cycle: 427
+$803D	C8 		INY 			A:00	X:FF	Y:00	SP:FD	nv--dIZC	Cycle: 433
+$803E	C0 10 		CPY #10			A:00	X:FF	Y:01	SP:FD	nv--dIzC	Cycle: 435
+$8040	D0 F8 		BNE $803A		A:00	X:FF	Y:01	SP:FD	Nv--dIzc	Cycle: 437
+$803A	98 		TYA 			A:00	X:FF	Y:01	SP:FD	Nv--dIzc	Cycle: 440
+$803B	91 FE 		STA ($00FE), Y -> $0021	A:01	X:FF	Y:01	SP:FD	nv--dIzc	Cycle: 442
+$803D	C8 		INY 			A:01	X:FF	Y:01	SP:FD	nv--dIzc	Cycle: 448
+$803E	C0 10 		CPY #10			A:01	X:FF	Y:02	SP:FD	nv--dIzc	Cycle: 450
+$8040	D0 F8 		BNE $803A		A:01	X:FF	Y:02	SP:FD	Nv--dIzc	Cycle: 452
+$803A	98 		TYA 			A:01	X:FF	Y:02	SP:FD	Nv--dIzc	Cycle: 455
+$803B	91 FE 		STA ($00FE), Y -> $0022	A:02	X:FF	Y:02	SP:FD	nv--dIzc	Cycle: 457
+$803D	C8 		INY 			A:02	X:FF	Y:02	SP:FD	nv--dIzc	Cycle: 463
+$803E	C0 10 		CPY #10			A:02	X:FF	Y:03	SP:FD	nv--dIzc	Cycle: 465
+$8040	D0 F8 		BNE $803A		A:02	X:FF	Y:03	SP:FD	Nv--dIzc	Cycle: 467
+$803A	98 		TYA 			A:02	X:FF	Y:03	SP:FD	Nv--dIzc	Cycle: 470
+$803B	91 FE 		STA ($00FE), Y -> $0023	A:03	X:FF	Y:03	SP:FD	nv--dIzc	Cycle: 472
+$803D	C8 		INY 			A:03	X:FF	Y:03	SP:FD	nv--dIzc	Cycle: 478
+$803E	C0 10 		CPY #10			A:03	X:FF	Y:04	SP:FD	nv--dIzc	Cycle: 480
+$8040	D0 F8 		BNE $803A		A:03	X:FF	Y:04	SP:FD	Nv--dIzc	Cycle: 482
+$803A	98 		TYA 			A:03	X:FF	Y:04	SP:FD	Nv--dIzc	Cycle: 485
+$803B	91 FE 		STA ($00FE), Y -> $0024	A:04	X:FF	Y:04	SP:FD	nv--dIzc	Cycle: 487
+$803D	C8 		INY 			A:04	X:FF	Y:04	SP:FD	nv--dIzc	Cycle: 493
+$803E	C0 10 		CPY #10			A:04	X:FF	Y:05	SP:FD	nv--dIzc	Cycle: 495
+$8040	D0 F8 		BNE $803A		A:04	X:FF	Y:05	SP:FD	Nv--dIzc	Cycle: 497
+$803A	98 		TYA 			A:04	X:FF	Y:05	SP:FD	Nv--dIzc	Cycle: 500
+$803B	91 FE 		STA ($00FE), Y -> $0025	A:05	X:FF	Y:05	SP:FD	nv--dIzc	Cycle: 502
+$803D	C8 		INY 			A:05	X:FF	Y:05	SP:FD	nv--dIzc	Cycle: 508
+$803E	C0 10 		CPY #10			A:05	X:FF	Y:06	SP:FD	nv--dIzc	Cycle: 510
+$8040	D0 F8 		BNE $803A		A:05	X:FF	Y:06	SP:FD	Nv--dIzc	Cycle: 512
+$803A	98 		TYA 			A:05	X:FF	Y:06	SP:FD	Nv--dIzc	Cycle: 515
+$803B	91 FE 		STA ($00FE), Y -> $0026	A:06	X:FF	Y:06	SP:FD	nv--dIzc	Cycle: 517
+$803D	C8 		INY 			A:06	X:FF	Y:06	SP:FD	nv--dIzc	Cycle: 523
+$803E	C0 10 		CPY #10			A:06	X:FF	Y:07	SP:FD	nv--dIzc	Cycle: 525
+$8040	D0 F8 		BNE $803A		A:06	X:FF	Y:07	SP:FD	Nv--dIzc	Cycle: 527
+$803A	98 		TYA 			A:06	X:FF	Y:07	SP:FD	Nv--dIzc	Cycle: 530
+$803B	91 FE 		STA ($00FE), Y -> $0027	A:07	X:FF	Y:07	SP:FD	nv--dIzc	Cycle: 532
+$803D	C8 		INY 			A:07	X:FF	Y:07	SP:FD	nv--dIzc	Cycle: 538
+$803E	C0 10 		CPY #10			A:07	X:FF	Y:08	SP:FD	nv--dIzc	Cycle: 540
+$8040	D0 F8 		BNE $803A		A:07	X:FF	Y:08	SP:FD	Nv--dIzc	Cycle: 542
+$803A	98 		TYA 			A:07	X:FF	Y:08	SP:FD	Nv--dIzc	Cycle: 545
+$803B	91 FE 		STA ($00FE), Y -> $0028	A:08	X:FF	Y:08	SP:FD	nv--dIzc	Cycle: 547
+$803D	C8 		INY 			A:08	X:FF	Y:08	SP:FD	nv--dIzc	Cycle: 553
+$803E	C0 10 		CPY #10			A:08	X:FF	Y:09	SP:FD	nv--dIzc	Cycle: 555
+$8040	D0 F8 		BNE $803A		A:08	X:FF	Y:09	SP:FD	Nv--dIzc	Cycle: 557
+$803A	98 		TYA 			A:08	X:FF	Y:09	SP:FD	Nv--dIzc	Cycle: 560
+$803B	91 FE 		STA ($00FE), Y -> $0029	A:09	X:FF	Y:09	SP:FD	nv--dIzc	Cycle: 562
+$803D	C8 		INY 			A:09	X:FF	Y:09	SP:FD	nv--dIzc	Cycle: 568
+$803E	C0 10 		CPY #10			A:09	X:FF	Y:0A	SP:FD	nv--dIzc	Cycle: 570
+$8040	D0 F8 		BNE $803A		A:09	X:FF	Y:0A	SP:FD	Nv--dIzc	Cycle: 572
+$803A	98 		TYA 			A:09	X:FF	Y:0A	SP:FD	Nv--dIzc	Cycle: 575
+$803B	91 FE 		STA ($00FE), Y -> $002A	A:0A	X:FF	Y:0A	SP:FD	nv--dIzc	Cycle: 577
+$803D	C8 		INY 			A:0A	X:FF	Y:0A	SP:FD	nv--dIzc	Cycle: 583
+$803E	C0 10 		CPY #10			A:0A	X:FF	Y:0B	SP:FD	nv--dIzc	Cycle: 585
+$8040	D0 F8 		BNE $803A		A:0A	X:FF	Y:0B	SP:FD	Nv--dIzc	Cycle: 587
+$803A	98 		TYA 			A:0A	X:FF	Y:0B	SP:FD	Nv--dIzc	Cycle: 590
+$803B	91 FE 		STA ($00FE), Y -> $002B	A:0B	X:FF	Y:0B	SP:FD	nv--dIzc	Cycle: 592
+$803D	C8 		INY 			A:0B	X:FF	Y:0B	SP:FD	nv--dIzc	Cycle: 598
+$803E	C0 10 		CPY #10			A:0B	X:FF	Y:0C	SP:FD	nv--dIzc	Cycle: 600
+$8040	D0 F8 		BNE $803A		A:0B	X:FF	Y:0C	SP:FD	Nv--dIzc	Cycle: 602
+$803A	98 		TYA 			A:0B	X:FF	Y:0C	SP:FD	Nv--dIzc	Cycle: 605
+$803B	91 FE 		STA ($00FE), Y -> $002C	A:0C	X:FF	Y:0C	SP:FD	nv--dIzc	Cycle: 607
+$803D	C8 		INY 			A:0C	X:FF	Y:0C	SP:FD	nv--dIzc	Cycle: 613
+$803E	C0 10 		CPY #10			A:0C	X:FF	Y:0D	SP:FD	nv--dIzc	Cycle: 615
+$8040	D0 F8 		BNE $803A		A:0C	X:FF	Y:0D	SP:FD	Nv--dIzc	Cycle: 617
+$803A	98 		TYA 			A:0C	X:FF	Y:0D	SP:FD	Nv--dIzc	Cycle: 620
+$803B	91 FE 		STA ($00FE), Y -> $002D	A:0D	X:FF	Y:0D	SP:FD	nv--dIzc	Cycle: 622
+$803D	C8 		INY 			A:0D	X:FF	Y:0D	SP:FD	nv--dIzc	Cycle: 628
+$803E	C0 10 		CPY #10			A:0D	X:FF	Y:0E	SP:FD	nv--dIzc	Cycle: 630
+$8040	D0 F8 		BNE $803A		A:0D	X:FF	Y:0E	SP:FD	Nv--dIzc	Cycle: 632
+$803A	98 		TYA 			A:0D	X:FF	Y:0E	SP:FD	Nv--dIzc	Cycle: 635
+$803B	91 FE 		STA ($00FE), Y -> $002E	A:0E	X:FF	Y:0E	SP:FD	nv--dIzc	Cycle: 637
+$803D	C8 		INY 			A:0E	X:FF	Y:0E	SP:FD	nv--dIzc	Cycle: 643
+$803E	C0 10 		CPY #10			A:0E	X:FF	Y:0F	SP:FD	nv--dIzc	Cycle: 645
+$8040	D0 F8 		BNE $803A		A:0E	X:FF	Y:0F	SP:FD	Nv--dIzc	Cycle: 647
+$803A	98 		TYA 			A:0E	X:FF	Y:0F	SP:FD	Nv--dIzc	Cycle: 650
+$803B	91 FE 		STA ($00FE), Y -> $002F	A:0F	X:FF	Y:0F	SP:FD	nv--dIzc	Cycle: 652
+$803D	C8 		INY 			A:0F	X:FF	Y:0F	SP:FD	nv--dIzc	Cycle: 658
+$803E	C0 10 		CPY #10			A:0F	X:FF	Y:10	SP:FD	nv--dIzc	Cycle: 660
+$8040	D0 F8 		BNE $803A		A:0F	X:FF	Y:10	SP:FD	nv--dIZC	Cycle: 662
+$8042	A9 30 		LDA #30			A:0F	X:FF	Y:10	SP:FD	nv--dIZC	Cycle: 664
+$8044	85 FE 		STA <$FE		A:30	X:FF	Y:10	SP:FD	nv--dIzC	Cycle: 666
+$8046	A2 02 		LDX #02			A:30	X:FF	Y:10	SP:FD	nv--dIzC	Cycle: 669
+$8048	A9 80 		LDA #80			A:30	X:02	Y:10	SP:FD	nv--dIzC	Cycle: 671
+$804A	81 FC 		STA ($00FC, X) -> $0030	A:80	X:02	Y:10	SP:FD	Nv--dIzC	Cycle: 673
+$804C	A9 10 		LDA #10			A:80	X:02	Y:10	SP:FD	Nv--dIzC	Cycle: 679
+$804E	85 31 		STA <$31		A:10	X:02	Y:10	SP:FD	nv--dIzC	Cycle: 681
+$8050	A9 90 		LDA #90			A:10	X:02	Y:10	SP:FD	nv--dIzC	Cycle: 684
+$8052	85 32 		STA <$32		A:90	X:02	Y:10	SP:FD	Nv--dIzC	Cycle: 686
+$8054	6C 31 00 	JMP ($0031) -> $9010	A:90	X:02	Y:10	SP:FD	Nv--dIzC	Cycle: 689
+$9010	A9 01 		LDA #01			A:90	X:02	Y:10	SP:FD	Nv--dIzC	Cycle: 694
+$9012	85 33 		STA <$33		A:01	X:02	Y:10	SP:FD	nv--dIzC	Cycle: 696
+$9014	02 		HLT 			A:01	X:02	Y:10	SP:FD	nv--dIzC	Cycle: 699

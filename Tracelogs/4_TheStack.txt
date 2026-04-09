@@ -1,0 +1,10 @@
+$FFFF	--		RESET			A:00	X:00	Y:00	SP:00	nv--dizc	Cycle: 0
+$8000	20 00 90 	JSR $9000		A:00	X:00	Y:00	SP:FD	nv--dIzc	Cycle: 7
+$9000	A9 01 		LDA #01			A:00	X:00	Y:00	SP:FB	nv--dIzc	Cycle: 13
+$9002	48 		PHA 			A:01	X:00	Y:00	SP:FB	nv--dIzc	Cycle: 15
+$9003	A9 5A 		LDA #5A			A:01	X:00	Y:00	SP:FA	nv--dIzc	Cycle: 18
+$9005	68 		PLA 			A:5A	X:00	Y:00	SP:FA	nv--dIzc	Cycle: 20
+$9006	60 		RTS 			A:01	X:00	Y:00	SP:FB	nv--dIzc	Cycle: 24
+$8003	AD FB 01 	LDA $01FB		A:01	X:00	Y:00	SP:FD	nv--dIzc	Cycle: 30
+$8006	85 00 		STA <$00		A:01	X:00	Y:00	SP:FD	nv--dIzc	Cycle: 34
+$8008	02 		HLT 			A:01	X:00	Y:00	SP:FD	nv--dIzc	Cycle: 37

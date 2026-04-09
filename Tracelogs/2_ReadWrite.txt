@@ -1,0 +1,10 @@
+$FFFF	--		RESET			A:00	X:00	Y:00	Cycle: 0
+$8100	A9 5A 		LDA #5A			A:00	X:00	Y:00	Cycle: 7
+$8102	85 00 		STA <$00		A:5A	X:00	Y:00	Cycle: 9
+$8104	A9 80 		LDA #80			A:5A	X:00	Y:00	Cycle: 12
+$8106	8D 50 05 	STA $0550		A:80	X:00	Y:00	Cycle: 14
+$8109	A5 00 		LDA <$00		A:80	X:00	Y:00	Cycle: 18
+$810B	85 01 		STA <$01		A:5A	X:00	Y:00	Cycle: 21
+$810D	AD 50 05 	LDA $0550		A:5A	X:00	Y:00	Cycle: 24
+$8110	85 02 		STA <$02		A:80	X:00	Y:00	Cycle: 28
+$8112	02 		HLT 			A:80	X:00	Y:00	Cycle: 31

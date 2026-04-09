@@ -1,0 +1,5 @@
+$FFFF	--		RESET			A:00	X:00	Y:00	Cycle: 0
+$8000	A9 5A 		LDA #5A			A:00	X:00	Y:00	Cycle: 7
+$8002	A2 12 		LDX #12			A:5A	X:00	Y:00	Cycle: 9
+$8004	A0 34 		LDY #34			A:5A	X:12	Y:00	Cycle: 11
+$8006	02 		HLT 			A:5A	X:12	Y:34	Cycle: 13

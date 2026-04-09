@@ -1,0 +1,11 @@
+$FFFF	--		RESET			A:00	X:00	Y:00	nv--dizc	Cycle: 0
+$8000	A9 8A 		LDA #8A			A:00	X:00	Y:00	nv--dIzc	Cycle: 7
+$8002	D0 01 		BNE $8005		A:8A	X:00	Y:00	Nv--dIzc	Cycle: 9
+$8005	30 01 		BMI $8008		A:8A	X:00	Y:00	Nv--dIzc	Cycle: 12
+$8008	A9 00 		LDA #00			A:8A	X:00	Y:00	Nv--dIzc	Cycle: 15
+$800A	D0 02 		BNE $800E		A:00	X:00	Y:00	nv--dIZc	Cycle: 17
+$800C	F0 01 		BEQ $800F		A:00	X:00	Y:00	nv--dIZc	Cycle: 19
+$800F	10 01 		BPL $8012		A:00	X:00	Y:00	nv--dIZc	Cycle: 22
+$8012	A9 01 		LDA #01			A:00	X:00	Y:00	nv--dIZc	Cycle: 25
+$8014	85 00 		STA <$00		A:01	X:00	Y:00	nv--dIzc	Cycle: 27
+$8016	02 		HLT 			A:01	X:00	Y:00	nv--dIzc	Cycle: 30
