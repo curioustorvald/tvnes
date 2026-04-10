@@ -10,12 +10,12 @@ config.frameskip = 2 // 0: invalid, 1: no skip, 2: every other frame, 3: every 3
 config.quit = 67 // quit = backspace
 config.p1a = 62 // A = space
 config.p1b = 29 // B = a
-config.p1u = 33 // UP = e
-config.p1l = 47 // LEFT = s
-config.p1d = 32 // DOWN = d
-config.p1r = 34 // RIGHT = f
-config.p1sta = 66 // START = return
 config.p1sel = 59 // SELECT = left shift
+config.p1sta = 66 // START = return
+config.p1u = 33 // UP = e
+config.p1d = 32 // DOWN = d
+config.p1l = 47 // LEFT = s
+config.p1r = 34 // RIGHT = f
 config.printTracelog = false
 
 // CPU status
@@ -77,6 +77,8 @@ e.ppuAddrBus = (0x0) >>> 0
 e.ppu8stepTemp = 0|0
 e.ppu8stepNextChar = 0|0
 e.ppuScrollFineX = 0|0
+// controller stuffs
+e.currentButtonStatus = 0|0
 // emulation stuffs
 e.drawNewFrame = false
 
@@ -1620,6 +1622,23 @@ graphics.setCursorYX(19, 1)
 
 reset()
 
+function updateButtonStatus() {
+    let status = 0
+    for (let i = -41; i >= -48; i--) {
+        let key = sys.peek(i)
+        if (key == 0) continue
+        if (key == config.p1a)   status |= (1 << 0)
+        if (key == config.p1b)   status |= (1 << 1)
+        if (key == config.p1sel) status |= (1 << 2)
+        if (key == config.p1sta) status |= (1 << 3)
+        if (key == config.p1u)   status |= (1 << 4)
+        if (key == config.p1d)   status |= (1 << 5)
+        if (key == config.p1l)   status |= (1 << 6)
+        if (key == config.p1r)   status |= (1 << 7)
+    }
+    e.currentButtonStatus = status
+}
+
 while (!appexit) {
     sys.poke(-40, 1)
     let keyCode = sys.peek(-41)
@@ -1629,6 +1648,7 @@ while (!appexit) {
         break
     }
 
+    updateButtonStatus()
     run()
     render()
 }
