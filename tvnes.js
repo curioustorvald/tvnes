@@ -5,6 +5,15 @@
 // config
 const config = {}
 config.frameskip = 2 // 0: invalid, 1: no skip, 2: every other frame, 3: every 3rd frame
+config.quit = 67 // quit = backspace
+config.p1a = 62 // A = space
+config.p1b = 29 // B = a
+config.p1u = 33 // UP = e
+config.p1l = 47 // LEFT = s
+config.p1d = 32 // DOWN = d
+config.p1r = 34 // RIGHT = f
+config.p1sta = 66 // START = return
+config.p1sel = 59 // SELECT = left shift
 
 // CPU status
 const e = {}
@@ -54,6 +63,17 @@ e.ppuSpritePatternTable = false
 e.ppuBGPatternTable = false
 e.ppuUse8x16Sprites = false
 e.ppuEnableNMI = false
+e.ppuShiftRegPtnL = (0x0) >>> 0
+e.ppuShiftRegPtnH = (0x0) >>> 0
+e.ppuShiftRegAtrL = (0x0) >>> 0
+e.ppuShiftRegAtrH = (0x0) >>> 0
+e.ppu8stepPtnLoBitplane = 0|0
+e.ppu8stepPtnHiBitplane = 0|0
+e.ppu8stepAttr = 0|0
+e.ppuAddrBus = (0x0) >>> 0
+e.ppu8stepTemp = 0|0
+e.ppu8stepNextChar = 0|0
+e.ppuScrollFineX = 0|0
 
 e.plotFB = (x, y, value) => {
     sys.poke(e.fb + y*256 + x, value)
@@ -144,28 +164,11 @@ function read(offset) { // always returns Uint
                 let vramAddr = e.vramAddr // latch
 
                 // read from the pattern table
-                if (vramAddr < 0x2000) {
-                    e.ppuReadBuffer = sys.peek(e.chr + vramAddr)
+                if (vramAddr > 0x3F00) {
+                    temp = readPPU(vramAddr)
                 }
-                // read from the nametables
-                else if (vramAddr < 0x3F00) {
-                    // horizontal mirroring
-                    if ((e.inesHdr[6] & 1) == 0) {
-                        e.ppuReadBuffer = sys.peek(e.vram + ((vramAddr & 0x3FF) | (vramAddr & 0x800) >>> 1))
-                    }
-                    // vertical mirroring
-                    else {
-                        e.ppuReadBuffer = sys.peek(e.vram + (vramAddr & 0x7FF))
-                    }
-                }
-                // read from palette RAM
                 else {
-                    if ((vramAddr & 3) == 0) {
-                        temp = sys.peek(e.pal + (vramAddr & 0x0F))
-                    }
-                    else {
-                        temp = sys.peek(e.pal + (vramAddr & 0x1F))
-                    }
+                    e.ppuReadBuffer = readPPU(vramAddr)
                 }
                 // auto-increment
                 e.vramAddr = (vramAddr + ((e.ppuVramInc32Mode) ? 32 : 1)) & 0x3FFF
@@ -211,6 +214,14 @@ function write(offset0, value) {
             case 0x2004: // OAMDATA
                 break
             case 0x2005: // PPUSCROLL
+                if (!e.writeLatch) {
+                    e.ppuScrollFineX = value & 7
+                    e._tempVramAddr = (e._tempVramAddr & 0b0111111111100000) | (value >>> 3)
+                }
+                else {
+                    e.transferAddr = (e._tempVramAddr & 0b0000110000011111) | (((value & 0xF8) << 2) | ((value & 7) << 12))
+                }
+                e.writeLatch = !e.writeLatch
                 break
             case 0x2006: // PPUADDR
                 // writing high byte?
@@ -1324,10 +1335,38 @@ function emulateCPU() {
     }
 }
 
+function readPPU(vramAddr) {
+    let temp = e.ppuReadBuffer
+
+    if (vramAddr < 0x2000) {
+        return sys.peek(e.chr + vramAddr)
+    }
+    // read from the nametables
+    else if (vramAddr < 0x3F00) {
+        // horizontal mirroring
+        if ((e.inesHdr[6] & 1) == 0) {
+            return sys.peek(e.vram + ((vramAddr & 0x3FF) | (vramAddr & 0x800) >>> 1))
+        }
+        // vertical mirroring
+        else {
+            return sys.peek(e.vram + (vramAddr & 0x7FF))
+        }
+    }
+    // read from palette RAM
+    else {
+        if ((vramAddr & 3) == 0) {
+            return sys.peek(e.pal + (vramAddr & 0x0F))
+        }
+        else {
+            return sys.peek(e.pal + (vramAddr & 0x1F))
+        }
+    }
+}
+
 function emulatePPU() {
     let ppuDot = e.ppuDot // latch
     let ppuScanline = e.ppuScanline
-    e.ppuDot = ppuDot + 1
+
     // wrap scanning beams
     if (ppuDot > 341) {
         ppuDot = 0; e.ppuDot = 0
@@ -1343,6 +1382,123 @@ function emulatePPU() {
     else if (ppuDot == 1 && ppuScanline == 261) {
         e.ppuVblank = false
     }
+
+    // is it visible or pre-render scanline
+    if (ppuScanline < 240 || ppuScanline == 261) {
+        if ((0 < ppuDot && ppuDot <= 256) || (320 < ppuDot && ppuDot <= 336)) {
+            // if rendering is enabled
+            if (e.ppuMaskRenderBG || e.ppuMaskRenderSprites) {
+                // if rendering the background, update the shift registers
+                if (e.ppuMaskRenderBG) {
+                    e.ppuShiftRegPtnL = (e.ppuShiftRegPtnL << 1) & 0xFFFF
+                    e.ppuShiftRegPtnH = (e.ppuShiftRegPtnH << 1) & 0xFFFF
+                    e.ppuShiftRegAtrL = (e.ppuShiftRegAtrL << 1) & 0xFFFF
+                    e.ppuShiftRegAtrH = (e.ppuShiftRegAtrH << 1) & 0xFFFF
+                }
+
+                let cycleTick = (ppuDot - 1) & 7
+                let vramAddr = e.vramAddr
+                let ppuAddrBus = e.ppuAddrBus
+                switch (cycleTick) {
+                    case 0:
+                        e.ppuShiftRegPtnL = (e.ppuShiftRegPtnL & 0xFF00) | e.ppu8stepPtnLoBitplane
+                        e.ppuShiftRegPtnH = (e.ppuShiftRegPtnH & 0xFF00) | e.ppu8stepPtnHiBitplane
+                        e.ppuShiftRegAtrL = (e.ppuShiftRegAtrL & 0xFF00) | ((e.ppu8stepAttr & 1) == 1 ? 0xFF : 0)
+                        e.ppuShiftRegAtrH = (e.ppuShiftRegAtrH & 0xFF00) | ((e.ppu8stepAttr & 2) == 2 ? 0xFF : 0)
+                        ppuAddrBus = 0x2000 | (e.vramAddr * 0x0FFF)
+                        e.ppuAddrBus = ppuAddrBus
+                        e.ppu8stepTemp = readPPU(ppuAddrBus)
+                        break
+                    case 1:
+                        e.ppu8stepNextChar = e.ppu8stepTemp
+                        break
+                    case 2:
+                        ppuAddrBus = 0x23C0 | (vramAddr & 0x0C00) | ((vramAddr >>> 4) & 0x38) | ((vramAddr >>> 2) & 0x07)
+                        e.ppuAddrBus = ppuAddrBus
+                        e.ppu8stepTemp = readPPU(ppuAddrBus)
+                        break
+                    case 3:
+                        let ppu8stepAttr = e.ppu8stepTemp
+                        // 1 byte of attribute covers 4 tiles. Figure out which title this is for
+                        if ((vramAddr & 3) >= 2) { // is right tile?
+                            ppu8stepAttr >>>= 2
+                        }
+                        if ((((vramAddr & 0b0000001111100000) >>> 5) & 3) >= 2) { // is bottom tile?
+                            ppu8stepAttr >>>= 4
+                        }
+                        ppu8stepAttr &= 3
+                        e.ppu8stepAttr = ppu8stepAttr
+                        break
+                    case 4:
+                        ppuAddrBus = (((vramAddr & 0x7000) >>> 12) | e.ppu8stepNextChar * 16 | (e.ppuBGPatternTable ? 0x1000 : 0))
+                        e.ppuAddrBus = ppuAddrBus
+                        e.ppu8stepTemp = readPPU(ppuAddrBus)
+                        break
+                    case 5:
+                        e.ppu8stepPtnLoBitplane = e.ppu8stepTemp
+                        e.ppuAddrBus += 8
+                        break
+                    case 6:
+                        e.ppu8stepTemp = readPPU(ppuAddrBus)
+                        break
+                    case 7:
+                        e.ppu8stepPtnHiBitplane = e.ppu8stepTemp
+
+                        if ((vramAddr & 0x001F) == 31) {
+                            vramAddr &= 0xFFE0 // resetting the scroll
+                            vramAddr ^= 0x0400 // crossing into the next nametable
+                        }
+                        else {
+                            vramAddr++
+                        }
+                        e.vramAddr = vramAddr
+                        break
+                }
+
+                
+                if (ppuDot == 256) {
+                    ppuIncrementScrollY(e.vramAddr)
+                }
+                else if (ppuDot == 257) {
+                    ppuResetScrollX(e.vramAddr)
+                }
+                else if (280 <= ppuDot && ppuDot <= 304 && ppuScanline == 261) {
+                    ppuResetScrollY(e.vramAddr)
+                }
+            }
+
+        }
+    }
+
+
+    e.ppuDot = ppuDot + 1
+}
+
+function ppuIncrementScrollY(vramAddr) {
+    if ((vramAddr & 0x7000) != 0x7000) {
+        e.vramAddr = vramAddr + 0x1000
+    }
+    else {
+        vramAddr &= 0x0FFF
+        let y = (vramAddr & 0x03E0) >>> 5
+        if (y == 29) {
+            y = 0
+            vramAddr ^= 0x0800
+        }
+        else {
+            y++; y &= 0x1F
+        }
+
+        e.vramAddr = (vramAddr & 0xFC1F) | (y << 5)
+    }
+}
+
+function ppuResetScrollX(vramAddr) {
+    e.vramAddr = ((vramAddr & 0b0111101111100000) | (e.transferAddr & 0b0000010000011111))
+}
+
+function ppuResetScrollY(vramAddr) {
+    e.vramAddr = ((vramAddr & 0b0000010000011111) | (e.transferAddr & 0b0111101111100000))
 }
 
 function drawPatternTable() {
