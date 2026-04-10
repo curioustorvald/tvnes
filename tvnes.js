@@ -2,6 +2,8 @@
 // Based on tutorial by 100thCoin
 // https://www.patreon.com/posts/making-your-nes-137873901
 
+let appexit = false
+
 // config
 const config = {}
 config.frameskip = 2 // 0: invalid, 1: no skip, 2: every other frame, 3: every 3rd frame
@@ -14,6 +16,7 @@ config.p1d = 32 // DOWN = d
 config.p1r = 34 // RIGHT = f
 config.p1sta = 66 // START = return
 config.p1sel = 59 // SELECT = left shift
+config.printTracelog = false
 
 // CPU status
 const e = {}
@@ -74,12 +77,15 @@ e.ppuAddrBus = (0x0) >>> 0
 e.ppu8stepTemp = 0|0
 e.ppu8stepNextChar = 0|0
 e.ppuScrollFineX = 0|0
+// emulation stuffs
+e.drawNewFrame = false
+
+
+// helper functions
 
 e.plotFB = (x, y, value) => {
     sys.poke(e.fb + y*256 + x, value)
 }
-
-// helper functions
 
 // change PC by offset with wrapping
 e.movPC = (offset) => {
@@ -362,9 +368,13 @@ function printTracelog(opcode) {
 function run() {
     while (!e.halted) {
         emulateCPU()
+        if (e.drawNewFrame) {
+            e.drawNewFrame = false
+            break
+        }
     }
 
-    serial.println("CPU Halted")
+    if (e.halted) serial.println("CPU Halted");
 }
 
 let cycles = 0
@@ -508,7 +518,7 @@ function emulateCPU() {
         opcode = 0x00
     }
 
-//    printTracelog(opcode)
+    if (config.printTracelog) printTracelog(opcode);
 
     switch(opcode) {
 
@@ -826,10 +836,6 @@ function emulateCPU() {
             temp = pullu16()
             e.pc = temp + 1
             cycles = 6
-            if (e.nmiFired == config.frameskip) {
-                render()
-                e.nmiFired = 0
-            }
             break
 
         // ADC
@@ -1367,17 +1373,9 @@ function emulatePPU() {
     let ppuDot = e.ppuDot // latch
     let ppuScanline = e.ppuScanline
 
-    // wrap scanning beams
-    if (ppuDot > 341) {
-        ppuDot = 0; e.ppuDot = 0
-        ppuScanline++; e.ppuScanline = ppuScanline
-        if (ppuScanline > 261) {
-            ppuScanline = 0; e.ppuScanline = 0
-        }
-    }
-
     if (ppuDot == 1 && ppuScanline == 241) {
         e.ppuVblank = true
+        e.drawNewFrame = true
     }
     else if (ppuDot == 1 && ppuScanline == 261) {
         e.ppuVblank = false
@@ -1455,7 +1453,7 @@ function emulatePPU() {
                         break
                 }
 
-                
+
                 if (ppuDot == 256) {
                     ppuIncrementScrollY(e.vramAddr)
                 }
@@ -1465,13 +1463,45 @@ function emulatePPU() {
                 else if (280 <= ppuDot && ppuDot <= 304 && ppuScanline == 261) {
                     ppuResetScrollY(e.vramAddr)
                 }
+
             }
 
+            if (ppuScanline < 241 && 0 < ppuDot && ppuDot <= 256) {
+                let palHi = 0
+                let palLo = 0
+
+                if (e.ppuMaskRenderBG && (ppuDot > 8 || e.ppuMask8pxMaskBG)) {
+                    let col0 = ((e.ppuShiftRegPtnL >>> (15 - e.ppuScrollFineX))) & 1
+                    let col1 = ((e.ppuShiftRegPtnH >>> (15 - e.ppuScrollFineX))) & 1
+                    palLo = (col1 << 1) | col0
+
+                    let pal0 = ((e.ppuShiftRegAtrL >>> (15 - e.ppuScrollFineX))) & 1
+                    let pal1 = ((e.ppuShiftRegAtrH >>> (15 - e.ppuScrollFineX))) & 1
+                    palHi = (pal1 << 1) | pal0
+
+                    if (palLo == 0 && palHi != 0) {
+                        palHi = 0
+                    }
+                }
+
+                // render to FB
+                let col = sys.peek(e.pal + palHi * 4 + palLo)
+                e.plotFB(ppuDot - 1, ppuScanline, col)
+            }
         }
     }
 
 
     e.ppuDot = ppuDot + 1
+
+    // wrap scanning beams
+    if (ppuDot > 341) {
+        ppuDot = 0; e.ppuDot = 0
+        ppuScanline++; e.ppuScanline = ppuScanline
+        if (ppuScanline > 261) {
+            ppuScanline = 0; e.ppuScanline = 0
+        }
+    }
 }
 
 function ppuIncrementScrollY(vramAddr) {
@@ -1553,7 +1583,7 @@ function drawNameTable() {
 ///////////////////////////////////////////////////////////////////////////////
 
 function render() {
-    drawNameTable()
+    //drawNameTable()
     fbToGPU(e.fb)
 }
 
@@ -1589,16 +1619,25 @@ graphics.clearText()
 graphics.setCursorYX(19, 1)
 
 reset()
-run()
+
+while (!appexit) {
+    sys.poke(-40, 1)
+    let keyCode = sys.peek(-41)
+
+    if (keyCode == config.quit) {
+        appexit = true
+        break
+    }
+
+    run()
+    render()
+}
 
 con.curs_set(1) // end of emulation loop, show cursor
 
-render()
-
-
 graphics.clearText()
-graphics.setCursorYX(19, 1)
-
+graphics.setCursorYX(1, 1)
+graphics.resetPalette()
 
 
 /*println(`PC = ${e.pc.toString(16)}`)
