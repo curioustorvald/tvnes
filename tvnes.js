@@ -2,6 +2,10 @@
 // Based on tutorial by 100thCoin
 // https://www.patreon.com/posts/making-your-nes-137873901
 
+// config
+const config = {}
+config.frameskip = 2 // 0: invalid, 1: no skip, 2: every other frame, 3: every 3rd frame
+
 // CPU status
 const e = {}
 // memory space and pointers
@@ -26,6 +30,7 @@ e.fOvf = false // Overflow flag
 e.fNeg = false // negative flag
 e.nmiLevel = false
 e.doNMI = false
+e.nmiFired = 0
 // PPU stuffs
 e.chr = sys.calloc(0x4000)
 e.vram = e.chr + 0x2000
@@ -346,8 +351,6 @@ function printTracelog(opcode) {
 function run() {
     while (!e.halted) {
         emulateCPU()
-        drawNameTable()
-        fbToGPU(e.fb)
     }
 
     serial.println("CPU Halted")
@@ -494,20 +497,20 @@ function emulateCPU() {
         opcode = 0x00
     }
 
-    printTracelog(opcode)
+//    printTracelog(opcode)
 
     switch(opcode) {
 
         // BRK
         case 0x00:
-            if (!doNMI) {
+            if (!e.doNMI) {
                 e.incPC() // skip padding byte
             }
             e.pushPC()
             push(packFlags(true))
-            e.fIntdis = true
-            e.pc = read(0xFFFE) | (read(0xFFFF) << 8)
+            e.pc = (e.doNMI) ? (read(0xFFFA) | (read(0xFFFB) << 8)) : (read(0xFFFE) | (read(0xFFFF) << 8))
             e.doNMI = false
+            e.nmiFired++
             cycles = 7
             break
 
@@ -812,6 +815,10 @@ function emulateCPU() {
             temp = pullu16()
             e.pc = temp + 1
             cycles = 6
+            if (e.nmiFired == config.frameskip) {
+                render()
+                e.nmiFired = 0
+            }
             break
 
         // ADC
@@ -1384,19 +1391,23 @@ function drawNameTable() {
 
 ///////////////////////////////////////////////////////////////////////////////
 
+function render() {
+    drawNameTable()
+    fbToGPU(e.fb)
+}
+
 // copy framebuffer data to GPU
 function fbToGPU(fb) {
-    // TODO use memcpy to deliver 224 scanlines
-    for (let y = 0; y < 240; y++) {
-        for (let x = 0; x < 256; x++) {
-            let pixel = sys.peek(fb + (y * 256 + x ))
-            graphics.plotPixel(x, y, pixel)
-        }
+    for (let y = 8; y < 232; y++) {
+        let from = fb + y * 256
+        let to = -(1048577 + (y - 8) * 280 + 12)
+        sys.memcpy(from, to, 256)
     }
 }
 
 ///////////////////////////////////////////////////////////////////////////////
 
+graphics.setGraphicsMode(1)
 con.curs_set(0) // hide cursor
 graphics.clearText()
 graphics.setCursorYX(19, 1)
@@ -1406,8 +1417,7 @@ run()
 
 con.curs_set(1) // end of emulation loop, show cursor
 
-drawNameTable()
-fbToGPU(e.fb)
+render()
 
 
 graphics.clearText()
