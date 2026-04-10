@@ -1370,17 +1370,22 @@ function drawPatternTable() {
 function drawNameTable() {
     for (let row = 0; row < 30; row++) {
         for (let column = 0; column < 32; column++) {
+            let attrOffset = ((column >>> 2) + (row >>> 2) * 8) & 255
+            let attr = sys.peek(e.vram + 0x3C0 + attrOffset)
+            let quadrant = (((column >>> 1) & 1) + ((row >>> 1) & 1) * 2) & 255
+            let pair = (attr >>> (quadrant * 2)) & 3
+
             for (let y = 0; y < 8; y++) {
                 let useSecondPatternTable = e.ppuBGPatternTable ? 4096 : 0
                 let loByte = sys.peek(e.chr + sys.peek(e.vram + column + row*32) * 16 + y + useSecondPatternTable)
                 let hiByte = sys.peek(e.chr + sys.peek(e.vram + column + row*32) * 16 + y + 8 + useSecondPatternTable)
+
                 for (let x = 0; x < 8; x++) {
                     let twobit = (((loByte >>> (7-x)) & 1) == 1) ? 1 : 0
                        twobit += (((hiByte >>> (7-x)) & 1) == 1) ? 2 : 0
+                    // backdrop colour (index 0 always use colour 0 of palette 0)
+                    let pixel = (twobit == 0) ? sys.peek(e.pal) : sys.peek(e.pal + twobit + pair * 4)
 
-                    // TODO read from palette
-                    let palette = [240, 245, 250, 239]
-                    let pixel = palette[twobit]
                     e.plotFB(x + column*8, y + row*8, pixel)
                 }
             }
@@ -1405,9 +1410,24 @@ function fbToGPU(fb) {
     }
 }
 
+function uploadNESmasterPal() {
+    let twoc02 = [0x666F,0x019F,0x10AF,0x409F,0x606F,0x602F,0x600F,0x410F,0x230F,0x040F,0x040F,0x041F,0x035F,0x000F,0x000F,0x000F,0xAAAF,0x04DF,0x32FF,0x71FF,0x90BF,0xB16F,0xA20F,0x840F,0x560F,0x270F,0x080F,0x083F,0x069F,0x000F,0x000F,0x000F,0xFFFF,0x5AFF,0x88FF,0xB6FF,0xD6FF,0xF6CF,0xF76F,0xD92F,0xBA0F,0x8C0F,0x5D2F,0x3D6F,0x3CCF,0x444F,0x000F,0x000F,0xFFFF,0xBEFF,0xCDFF,0xECFF,0xFCFF,0xFCEF,0xFCCF,0xFDAF,0xED9F,0xDE9F,0xCEAF,0xBECF,0xBEEF,0xBBBF,0x000F,0x000F]
+    let twoc03 = [0x666F,0x029F,0x00DF,0x64DF,0x906F,0xB06F,0xB20F,0x940F,0x640F,0x240F,0x062F,0x090F,0x044F,0x000F,0x000F,0x000F,0xBBBF,0x06DF,0x04FF,0x90FF,0xB0FF,0xF09F,0xF00F,0xD60F,0x960F,0x290F,0x090F,0x0B6F,0x099F,0x000F,0x000F,0x000F,0xFFFF,0x6BFF,0x99FF,0xD6FF,0xF0FF,0xF6FF,0xF90F,0xFB0F,0xDD0F,0x6D0F,0x0F0F,0x4FDF,0x0FFF,0x000F,0x000F,0x000F,0xFFFF,0xBDFF,0xDBFF,0xFBFF,0xF9FF,0xFBBF,0xFD9F,0xFF4F,0xFF6F,0xBF4F,0x9F6F,0x4FDF,0x9DFF,0x000F,0x000F,0x000F]
+    let rgba = twoc02
+
+    // upload to TSVM palette index 0..63
+    for (let i = 0; i < 64; i++) {
+        let rg = (rgba[i] >>> 8) & 0xFF
+        let ba = rgba[i] & 0xFF
+        let addr = -(1310209 + 2*i)
+        sys.poke(addr, rg); sys.poke(addr - 1, ba)
+    }
+}
+
 ///////////////////////////////////////////////////////////////////////////////
 
 graphics.setGraphicsMode(1)
+uploadNESmasterPal()
 con.curs_set(0) // hide cursor
 graphics.clearText()
 graphics.setCursorYX(19, 1)
