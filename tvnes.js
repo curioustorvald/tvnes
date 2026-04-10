@@ -5,7 +5,7 @@
 // CPU status
 const e = {}
 // memory space and pointers
-e.mem = sys.malloc(65536)
+e.mem = sys.calloc(0x10000)
 e.ram = e.mem + 0
 e.rom = e.mem + 0x8000
 // iNES header goes here
@@ -24,6 +24,35 @@ e.fIntdis = false // Interrupt disable
 e.fDec = false // Decimal mode. Does absolutely nothing on NES
 e.fOvf = false // Overflow flag
 e.fNeg = false // negative flag
+e.nmiLevel = false
+e.doNMI = false
+// PPU stuffs
+e.chr = sys.calloc(0x4000)
+e.vram = e.chr + 0x2000
+e.pal = e.chr + 0x3F00
+e.fb = sys.calloc(256 * 240) // only 224 scanlines are visible but 240 lines should be rendered
+e.writeLatch = false
+e.transferAddr = (0x0) >>> 0
+e.vramAddr = (0x0) >>> 0
+e._tempVramAddr = (0x0) >>> 0
+e.ppuVramInc32Mode = false
+e.ppuReadBuffer = 0|0
+e.ppuDot = 0|0 // scanning beam X pos
+e.ppuScanline = 0|0 // scanning beam Y pos
+e.ppuVblank = false
+e.ppuMask8pxMaskBG = false
+e.ppuMask8pxMaskSprites = false
+e.ppuMaskRenderBG = false
+e.ppuMaskRenderSprites = false
+e.ppuNametableSelect = 0|0
+e.ppuSpritePatternTable = false
+e.ppuBGPatternTable = false
+e.ppuUse8x16Sprites = false
+e.ppuEnableNMI = false
+
+e.plotFB = (x, y, value) => {
+    sys.poke(e.fb + y*256 + x, value)
+}
 
 // helper functions
 
@@ -79,6 +108,8 @@ e.pushPC = () => {
 
 e.free = () => {
     sys.free(e.mem)
+    sys.free(e.chr)
+    sys.free(e.fb)
 }
 
 ///////////////////////////////////////////////////////////////////////////////
@@ -91,6 +122,53 @@ if (fullFilePath === undefined) {
 
 function read(offset) { // always returns Uint
     // TODO memmap and mirroring
+
+    // reading from PPU
+    if (0x2000 <= offset && offset < 0x4000) {
+        offset &= 0x2007
+        switch (offset) {
+            case 0x2002: // PPUSTATUS
+                let ppuStatus = 0|0
+                ppuStatus |= (e.ppuVblank) ? 0x80 : 0
+                ppuStatus |= 0x40
+                e.ppuVblank = false
+                e.writeLatch = false
+                return ppuStatus
+            case 0x2007: // PPUDATA
+                let temp = e.ppuReadBuffer
+                let vramAddr = e.vramAddr // latch
+
+                // read from the pattern table
+                if (vramAddr < 0x2000) {
+                    e.ppuReadBuffer = sys.peek(e.chr + vramAddr)
+                }
+                // read from the nametables
+                else if (vramAddr < 0x3F00) {
+                    // horizontal mirroring
+                    if ((e.inesHdr[6] & 1) == 0) {
+                        e.ppuReadBuffer = sys.peek(e.vram + ((vramAddr & 0x3FF) | (vramAddr & 0x800) >>> 1))
+                    }
+                    // vertical mirroring
+                    else {
+                        e.ppuReadBuffer = sys.peek(e.vram + (vramAddr & 0x7FF))
+                    }
+                }
+                // read from palette RAM
+                else {
+                    if ((vramAddr & 3) == 0) {
+                        temp = sys.peek(e.pal + (vramAddr & 0x0F))
+                    }
+                    else {
+                        temp = sys.peek(e.pal + (vramAddr & 0x1F))
+                    }
+                }
+                // auto-increment
+                e.vramAddr = (vramAddr + ((e.ppuVramInc32Mode) ? 32 : 1)) & 0x3FFF
+                return temp
+            default:
+                return 0
+        }
+    }
     return (sys.peek(e.mem + offset) >>> 0) & 255
 }
 
@@ -102,8 +180,84 @@ function readSigned(offset) {
 function write(offset0, value) {
     var offset = offset0; while (offset < 0) offset += 65536; // Q&D negative addr wrapping
     // TODO memmap and mirroring
-    if (offset < 0x8000) {
-        sys.poke(e.mem + offset, value)
+
+    // write to PPU
+    if (0x2000 <= offset && offset < 0x4000) {
+        offset &= 0x2007
+        switch (offset) {
+            case 0x2000: // PPUCTRL
+                e.ppuNametableSelect = value & 3
+                e.ppuVramInc32Mode = (value & 4) != 0
+                e.ppuSpritePatternTable = (value & 8) != 0
+                e.ppuBGPatternTable = (value & 16) != 0
+                e.ppuUse8x16Sprites = (value & 32) != 0
+                e.ppuEnableNMI = (value & 128) != 0
+                break
+            case 0x2001: // PPUMASK
+                e.ppuMask8pxMaskBG = (value & 2) != 0
+                e.ppuMask8pxMaskSprites = (value & 4) != 0
+                e.ppuMaskRenderBG = (value & 8) != 0
+                e.ppuMaskRenderSprites = (value & 16) != 0
+                break
+            case 0x2002: // PPUSTATUS
+                break
+            case 0x2003: // OAMADDR
+                break
+            case 0x2004: // OAMDATA
+                break
+            case 0x2005: // PPUSCROLL
+                break
+            case 0x2006: // PPUADDR
+                // writing high byte?
+                if (!e.writeLatch) {
+                    e._tempVramAddr = (value & 0x3F) << 8
+                    e.writeLatch = true
+                }
+                // writing low byte?
+                else {
+                    let w = e._tempVramAddr | value
+                    e.vramAddr = w
+                    e.transferAddr = w
+                    e.writeLatch = false
+                }
+                break
+            case 0x2007: // PPUDATA
+                let vramAddr = e.vramAddr // latch
+                // to pattern table
+                if (vramAddr < 0x2000) {
+                    // write to pattern table, if cartridge has CHR RAM instead of ROM
+                    if (e.inesHdr[5] == 0) {
+                        sys.poke(e.chr + vramAddr, value)
+                    }
+                }
+                // to nametable
+                else if (vramAddr < 0x3F00) {
+                    // horizontal mirroring
+                    if ((e.inesHdr[6] & 1) == 0) {
+                        sys.poke(e.vram + ((vramAddr & 0x3FF) | (vramAddr & 0x800) >>> 1), value)
+                    }
+                    // vertical mirroring
+                    else {
+                        sys.poke(e.vram + (vramAddr & 0x7FF), value)
+                    }
+                }
+                // to palette RAM
+                else {
+                    if ((vramAddr & 3) == 0) {
+                        sys.poke(e.pal + (vramAddr & 0x0F), value)
+                    }
+                    else {
+                        sys.poke(e.pal + (vramAddr & 0x1F), value)
+                    }
+                }
+                // auto-increment
+                e.vramAddr = (vramAddr + ((e.ppuVramInc32Mode) ? 32 : 1)) & 0x3FFF
+                break
+        }
+    }
+    // write to RAM with mirroring
+    else if (offset < 0x8000) {
+        sys.poke(e.mem + (offset & 0x7FF), value)
     }
 }
 
@@ -124,16 +278,18 @@ function pullu16() {
 function reset() {
     let romFile = files.open(fullFilePath.full)
     let romFileSize = romFile.size
-    let inesRomPtr = sys.malloc(romFileSize)
-    romFile.pread(inesRomPtr, romFileSize, 0)
+    let headeredRom = sys.calloc(romFileSize)
+    romFile.pread(headeredRom, romFileSize, 0)
 
     // copy ROM
-    sys.memcpy(inesRomPtr + 16, e.rom, 0x8000)
+    sys.memcpy(headeredRom + 0x10, e.rom, 0x8000)
+    // copy CHR
+    sys.memcpy(headeredRom + 0x8010, e.chr, 0x2000)
     // copy iNES header
     for (let i = 0; i < 16; i++) {
-        e.inesHdr[i] = sys.peek(inesRomPtr + i)
+        e.inesHdr[i] = sys.peek(headeredRom + i)
     }
-    sys.free(inesRomPtr)
+    sys.free(headeredRom)
 
     // run RESET vector
     e.fIntdis = true
@@ -143,10 +299,58 @@ function reset() {
     e.sp = 0xFD
 }
 
+const opcodeNames = [
+'BRK','ORA','HLT','SLO','NOP','ORA','ASL','SLO','PHP','ORA','ASL','ANC','NOP','ORA','ASL','SLO',
+'BPL','ORA','HLT','SLO','NOP','ORA','ASL','SLO','CLC','ORA','NOP','SLO','NOP','ORA','ASL','SLO',
+'JSR','AND','HLT','RLA','BIT','AND','ROL','RLA','PLP','AND','ROL','ANC','BIT','AND','ROL','RLA',
+'BMI','AND','HLT','RLA','NOP','AND','ROL','RLA','SEC','AND','NOP','RLA','NOP','AND','ROL','RLA',
+'RTI','EOR','HLT','SRE','NOP','EOR','LSR','SRE','PHA','EOR','LSR','ALR','JMP','EOR','LSR','SRE',
+'BVC','EOR','HLT','SRE','NOP','EOR','LSR','SRE','CLI','EOR','NOP','SRE','NOP','EOR','LSR','SRE',
+'RTS','ADC','HLT','RRA','NOP','ADC','ROR','RRA','PLA','ADC','ROR','ARR','JMP','ADC','ROR','RRA',
+'BVS','ADC','HLT','RRA','NOP','ADC','ROR','RRA','SEI','ADC','NOP','RRA','NOP','ADC','ROR','RRA',
+'NOP','STA','NOP','SAX','STY','STA','STX','SAX','DEY','NOP','TXA','ANE','STY','STA','STX','SAX',
+'BCC','STA','HLT','SHA','STY','STA','STX','SAX','TYA','STA','TXS','SHS','SHY','STA','SHX','SHA',
+'LDY','LDA','LDX','LAX','LDY','LDA','LDX','LAX','TAY','LDA','TAX','LXA','LDY','LDA','LDX','LAX',
+'BCS','LDA','HLT','LAX','LDY','LDA','LDX','LAX','CLV','LDA','TSX','LAE','LDY','LDA','LDX','LAX',
+'CPY','CMP','NOP','DCP','CPY','CMP','DEC','DCP','INY','CMP','DEX','AXS','CPY','CMP','DEC','DCP',
+'BNE','CMP','HLT','DCP','NOP','CMP','DEC','DPC','CLD','CMP','NOP','DCP','NOP','CMP','DEC','DCP',
+'CPX','SBC','NOP','ISC','CPX','SBC','INC','ISC','INX','SBC','NOP','SBC','CPX','SBC','INC','ISC',
+'BEQ','SBC','HLT','ISC','NOP','SBC','INC','ISC','SED','SBC','NOP','ISC','NOP','SBC','INC','ISC','NMI'
+]
+
+let traceLogCnt = 0
+function printTracelog(opcode) {
+    let pc = e.pc // latch
+    if (!e.doNMI) { pc-- }
+    if (pc < 0) pc += 65536
+    if (e.doNMI) { opcode = 0x100 }
+    let sp = e.sp
+    let a = e.a
+    let x = e.x
+    let y = e.y
+    let flags = (e.fNeg ? 'N' : 'n') + (e.fOvf ? 'V' : 'v') + '--' + (e.fDec ? 'D' : 'd') +
+            (e.fIntdis ? 'I' : 'i') + (e.fZero ? 'Z' : 'z') + (e.fCarry ? 'C' : 'c')
+    let s = `${traceLogCnt.toString().padStart(8,' ')} ; PC = $${pc.toString(16).padStart(4,'0')}    ` +
+            `Op = ${opcode.toString(16).padStart(2,'0')} (${opcodeNames[opcode]})    ` +
+            `A: ${a.toString(16).padStart(2,'0')} , ` +
+            `X: ${x.toString(16).padStart(2,'0')} , ` +
+            `Y: ${y.toString(16).padStart(2,'0')} , ` +
+            `SP: ${sp.toString(16).padStart(2,'0')}    ` +
+            `Flags: ${flags}`
+
+    serial.println(s)
+
+    traceLogCnt++
+}
+
 function run() {
     while (!e.halted) {
         emulateCPU()
+        drawNameTable()
+        fbToGPU(e.fb)
     }
+
+    serial.println("CPU Halted")
 }
 
 let cycles = 0
@@ -277,17 +481,33 @@ function unpackFlags(val) {
 }
 
 function emulateCPU() {
-    opcode = e.readPC()
+    let prevNMIlevel = e.nmiLevel
+    e.nmiLevel = e.ppuEnableNMI && e.ppuVblank
+    if (!prevNMIlevel && e.nmiLevel) {
+        e.doNMI = true
+    }
+
+    if (!e.doNMI) {
+        opcode = e.readPC()
+    }
+    else {
+        opcode = 0x00
+    }
+
+    printTracelog(opcode)
 
     switch(opcode) {
 
         // BRK
         case 0x00:
-            e.incPC() // skip padding byte
+            if (!doNMI) {
+                e.incPC() // skip padding byte
+            }
             e.pushPC()
             push(packFlags(true))
             e.fIntdis = true
             e.pc = read(0xFFFE) | (read(0xFFFF) << 8)
+            e.doNMI = false
             cycles = 7
             break
 
@@ -1087,26 +1307,127 @@ function emulateCPU() {
             e.halted = true
             break
     }
+
+    // this is timing-inaccurate but oh well
+    while (cycles > 0) {
+        cycles--
+        emulatePPU()
+        emulatePPU()
+        emulatePPU()
+    }
+}
+
+function emulatePPU() {
+    let ppuDot = e.ppuDot // latch
+    let ppuScanline = e.ppuScanline
+    e.ppuDot = ppuDot + 1
+    // wrap scanning beams
+    if (ppuDot > 341) {
+        ppuDot = 0; e.ppuDot = 0
+        ppuScanline++; e.ppuScanline = ppuScanline
+        if (ppuScanline > 261) {
+            ppuScanline = 0; e.ppuScanline = 0
+        }
+    }
+
+    if (ppuDot == 1 && ppuScanline == 241) {
+        e.ppuVblank = true
+    }
+    else if (ppuDot == 1 && ppuScanline == 261) {
+        e.ppuVblank = false
+    }
+}
+
+function drawPatternTable() {
+    for (let table = 0; table < 2; table++) {
+        for (let row = 0; row < 16; row++) {
+            for (let column = 0; column < 16; column++) {
+                for (let y = 0; y < 8; y++) {
+                    let loByte = sys.peek(e.chr + (0+y + column*16 + row*256 + table*4096))
+                    let hiByte = sys.peek(e.chr + (8+y + column*16 + row*256 + table*4096))
+                    for (let x = 0; x < 8; x++) {
+                        let twobit = (((loByte >>> (7-x)) & 1) == 1) ? 1 : 0
+                           twobit += (((hiByte >>> (7-x)) & 1) == 1) ? 2 : 0
+
+                        // TODO read from palette
+                        let palette = [240, 245, 250, 239]
+                        let pixel = palette[twobit]
+                        e.plotFB(x + column*8 + table*128, y + row*8, pixel)
+                    }
+                }
+            }
+        }
+    }
+}
+
+function drawNameTable() {
+    for (let row = 0; row < 30; row++) {
+        for (let column = 0; column < 32; column++) {
+            for (let y = 0; y < 8; y++) {
+                let useSecondPatternTable = e.ppuBGPatternTable ? 4096 : 0
+                let loByte = sys.peek(e.chr + sys.peek(e.vram + column + row*32) * 16 + y + useSecondPatternTable)
+                let hiByte = sys.peek(e.chr + sys.peek(e.vram + column + row*32) * 16 + y + 8 + useSecondPatternTable)
+                for (let x = 0; x < 8; x++) {
+                    let twobit = (((loByte >>> (7-x)) & 1) == 1) ? 1 : 0
+                       twobit += (((hiByte >>> (7-x)) & 1) == 1) ? 2 : 0
+
+                    // TODO read from palette
+                    let palette = [240, 245, 250, 239]
+                    let pixel = palette[twobit]
+                    e.plotFB(x + column*8, y + row*8, pixel)
+                }
+            }
+        }
+    }
+}
+
+
+///////////////////////////////////////////////////////////////////////////////
+
+// copy framebuffer data to GPU
+function fbToGPU(fb) {
+    // TODO use memcpy to deliver 224 scanlines
+    for (let y = 0; y < 240; y++) {
+        for (let x = 0; x < 256; x++) {
+            let pixel = sys.peek(fb + (y * 256 + x ))
+            graphics.plotPixel(x, y, pixel)
+        }
+    }
 }
 
 ///////////////////////////////////////////////////////////////////////////////
 
+con.curs_set(0) // hide cursor
+graphics.clearText()
+graphics.setCursorYX(19, 1)
+
 reset()
 run()
 
-println(`PC = ${e.pc.toString(16)}`)
+con.curs_set(1) // end of emulation loop, show cursor
+
+drawNameTable()
+fbToGPU(e.fb)
+
+
+graphics.clearText()
+graphics.setCursorYX(19, 1)
+
+
+
+/*println(`PC = ${e.pc.toString(16)}`)
 println(` A = ${e.a.toString(16)}`)
 println(` X = ${e.x.toString(16)}`)
 println(` Y = ${e.y.toString(16)}`)
 
-print("MEM:")
+print("PTN:")
 for (let i = 0; i < 64; i++) {
-    if (i % 16 == 0) print(`\n$${i.toString(16).padStart(4, '0')} : `)
-    let v = sys.peek(e.mem + i)
+    if (i % 16 == 0) print(`\n$${(i+0x8000).toString(16).padStart(4, '0')} : `)
+    let v = sys.peek(e.chr + i)
     print(v.toString(16).padStart(2, '0'))
     print(' ')
 }
-println()
+println()*/
 
 
 e.free()
