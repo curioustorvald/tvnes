@@ -281,9 +281,15 @@ function write(offset0, value) {
         }
     }
     // write to RAM with mirroring
-    else if (offset < 0x8000) {
+    else if (offset < 0x2000) {
         sys.poke(e.mem + (offset & 0x7FF), value)
     }
+    // APU / IO registers
+    else if (offset < 0x4020) {
+        // TODO: $4014 OAM DMA, $4016 controller strobe, APU channels
+        // for now, just swallow the write so it doesn't corrupt zero page
+    }
+    // cartridge space ($4020-$7FFF): SRAM / expansion, unused on mapper 0
 }
 
 function push(value) {
@@ -1404,7 +1410,7 @@ function emulatePPU() {
                         e.ppuShiftRegPtnH = (e.ppuShiftRegPtnH & 0xFF00) | e.ppu8stepPtnHiBitplane
                         e.ppuShiftRegAtrL = (e.ppuShiftRegAtrL & 0xFF00) | ((e.ppu8stepAttr & 1) == 1 ? 0xFF : 0)
                         e.ppuShiftRegAtrH = (e.ppuShiftRegAtrH & 0xFF00) | ((e.ppu8stepAttr & 2) == 2 ? 0xFF : 0)
-                        ppuAddrBus = 0x2000 + (e.vramAddr * 0x0FFF)
+                        ppuAddrBus = 0x2000 | (e.vramAddr & 0x0FFF)
                         e.ppuAddrBus = ppuAddrBus
                         e.ppu8stepTemp = readPPU(ppuAddrBus)
                         break
@@ -1438,7 +1444,7 @@ function emulatePPU() {
                         e.ppuAddrBus += 8
                         break
                     case 6:
-                        e.ppu8stepTemp = readPPU(ppuAddrBus)
+                        e.ppu8stepTemp = readPPU(e.ppuAddrBus)
                         break
                     case 7:
                         e.ppu8stepPtnHiBitplane = e.ppu8stepTemp
@@ -1482,14 +1488,21 @@ function emulatePPU() {
     }
 
 
-    if (ppuDot == 256) {
-        ppuIncrementScrollY(e.vramAddr)
-    }
-    else if (ppuDot == 257) {
-        ppuResetScrollX(e.vramAddr)
-    }
-    else if (280 <= ppuDot && ppuDot <= 304 && ppuScanline == 261) {
-        ppuResetScrollY(e.vramAddr)
+    // scroll register updates only happen during visible/pre-render scanlines,
+    // and only when rendering is enabled. Running these unconditionally would
+    // corrupt vramAddr during CPU-driven $2007 uploads (rendering off), because
+    // the X reset at dot 257 copies transferAddr.coarseX into vramAddr.coarseX,
+    // wiping out the auto-increment and causing writes to overwrite earlier tiles.
+    if ((e.ppuMaskRenderBG || e.ppuMaskRenderSprites) && (ppuScanline < 240 || ppuScanline == 261)) {
+        if (ppuDot == 256) {
+            ppuIncrementScrollY(e.vramAddr)
+        }
+        else if (ppuDot == 257) {
+            ppuResetScrollX(e.vramAddr)
+        }
+        else if (280 <= ppuDot && ppuDot <= 304 && ppuScanline == 261) {
+            ppuResetScrollY(e.vramAddr)
+        }
     }
 
     e.ppuDot = ppuDot + 1
@@ -1583,7 +1596,8 @@ function drawNameTable() {
 ///////////////////////////////////////////////////////////////////////////////
 
 function render() {
-    //drawNameTable()
+    // drawNameTable()
+    // drawPatternTable()
     fbToGPU(e.fb)
 }
 
