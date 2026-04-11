@@ -1335,7 +1335,7 @@ function emulateCPU() {
             doSBC(read(e.readPC()))
             cycles = 3
             break
-        case 0xE9: // SBC imm
+        case 0xE9: case 0xEB: // SBC imm
             doSBC(e.readPC())
             cycles = 2
             break
@@ -1362,8 +1362,10 @@ function emulateCPU() {
 
         // 3-byte NOP
         case 0x0C: case 0x1C: case 0x3C: case 0x5C: case 0x7C: case 0xDC: case 0xFC:
-            e.readPCu16()
-            cycles = 4
+            let base = e.readPCu16()
+            let addr  = (base + e.x) & 0xFFFF
+            pageCrossed = opcode != 0x0C && (base & 0xFF00) != (addr & 0xFF00)
+            cycles = 4 + pageCrossed
             break
 
         // 2-byte NOP
