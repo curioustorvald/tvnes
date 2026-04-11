@@ -44,9 +44,11 @@ e.nmiLevel = false
 e.doNMI = false
 e.nmiFired = 0
 // PPU stuffs
-e.chr = sys.calloc(0x4000)
+e.chr = e.mem + 0x2000
 e.vram = e.chr + 0x2000
 e.pal = e.chr + 0x3F00
+e.oam = sys.calloc(0x100)
+e.secondaryOAM = sys.calloc(0x20)
 e.fb = sys.calloc(256 * 240) // only 224 scanlines are visible but 240 lines should be rendered
 e.writeLatch = false
 e.transferAddr = (0x0) >>> 0
@@ -66,6 +68,8 @@ e.ppuSpritePatternTable = false
 e.ppuBGPatternTable = false
 e.ppuUse8x16Sprites = false
 e.ppuEnableNMI = false
+e.ppuStatusOverflow = false
+e.ppuStatusSprZeroHit = false
 e.ppuShiftRegPtnL = (0x0) >>> 0
 e.ppuShiftRegPtnH = (0x0) >>> 0
 e.ppuShiftRegAtrL = (0x0) >>> 0
@@ -77,8 +81,24 @@ e.ppuAddrBus = (0x0) >>> 0
 e.ppu8stepTemp = 0|0
 e.ppu8stepNextChar = 0|0
 e.ppuScrollFineX = 0|0
+e.ppuSpriteEvalTemp = 0|0
+e.ppuOAMaddr = 0|0
+e.ppuSecondaryOAMaddr = 0|0
+e.ppuSecondaryOAMfull = false
+e.ppuSpriteEvalTick = 0|0
+e.ppuScanlineContainsSprZero = false
+e.ppuSpriteEvalOAMovf = false
+e.ppuSecondaryOAMsize = 0|0
+e.ppuSpriteShiftRegL = new Uint8Array(8)
+e.ppuSpriteShiftRegH = new Uint8Array(8)
+e.ppuSpriteAtr = new Uint8Array(8)
+e.ppuSpritePtn = new Uint8Array(8)
+e.ppuSpritePosX = new Uint8Array(8)
+e.ppuSpritePosY = new Uint8Array(8)
 // controller stuffs
 e.currentButtonStatus = 0|0
+e.cnt1sr = 0|0
+e.cnt2sr = 0|0
 // emulation stuffs
 e.drawNewFrame = false
 
@@ -141,7 +161,8 @@ e.pushPC = () => {
 
 e.free = () => {
     sys.free(e.mem)
-    sys.free(e.chr)
+    sys.free(e.oam)
+    sys.free(e.secondaryOAM)
     sys.free(e.fb)
 }
 
@@ -163,7 +184,8 @@ function read(offset) { // always returns Uint
             case 0x2002: // PPUSTATUS
                 let ppuStatus = 0|0
                 ppuStatus |= (e.ppuVblank) ? 0x80 : 0
-                ppuStatus |= 0x40
+                ppuStatus |= (e.ppuStatusSprZeroHit) ? 0x40 : 0
+                ppuStatus |= (e.ppuStatusOverflow) ? 0x20 : 0
                 e.ppuVblank = false
                 e.writeLatch = false
                 return ppuStatus
@@ -184,6 +206,18 @@ function read(offset) { // always returns Uint
             default:
                 return 0
         }
+    }
+    // reading from Controller 1
+    if (offset == 0x4016) {
+        let controllerBit = (e.cnt1sr & 0x80) >> 7
+        e.cnt1sr <<= 1
+        return controllerBit
+    }
+    // reading from Controller 2
+    else if (offset == 0x4017) {
+        let controllerBit = (e.cnt2sr & 0x80) >> 7
+        e.cnt2sr <<= 1
+        return controllerBit
     }
     return sys.peek(e.mem + offset)
 }
@@ -288,6 +322,17 @@ function write(offset0, value) {
     else if (offset < 0x4020) {
         // TODO: $4014 OAM DMA, $4016 controller strobe, APU channels
         // for now, just swallow the write so it doesn't corrupt zero page
+        switch (offset) {
+            case 0x4014: // OAM DMA
+                for (let i = 0; i < 256; i++) {
+                    sys.poke(e.oam + i, read((value << 8) + i))
+                }
+                break
+            case 0x4016: // Controller strobe
+                e.cnt1sr = e.currentButtonStatus
+                e.cnt2sr = 0
+                break
+        }
     }
     // cartridge space ($4020-$7FFF): SRAM / expansion, unused on mapper 0
 }
@@ -1329,6 +1374,22 @@ function emulateCPU() {
             cycles = 2
             break
 
+        // XAA aka ANE
+        case 0x8B:
+            // many different 6502 variations show different results
+            // this code roughly follows MOS C01437706 0782 / 6502 KOREA 5231 07 03-82
+            let magic = 0xEE
+            // simulate thermal effects
+            if ((Math.random()*128)|0 < 1) magic |= 0x10;
+            if ((Math.random()*128)|0 < 1) magic |= 0x01;
+            let result = (e.a | magic) & e.x & e.readPC()
+            e.a = result
+            e.setResultFlags(result)
+            // randomly flip N and Z flag
+            if ((Math.random()*64)|0 < 1) e.fZero = !e.fZero;
+            if ((Math.random()*64)|0 < 1) e.fNeg = !e.fNeg;
+            cycles = 2
+
         // HLT (unofficial)
         case 0x02:
             e.halted = true
@@ -1376,6 +1437,159 @@ function readPPU(vramAddr) {
     }
 }
 
+function findCHRaddrForSprite(secondaryOAMslot, ppuScanline) {
+    // 8x8 sprites
+    if (!e.ppuUse8x16Sprites) {
+        if (((e.ppuSpriteAtr[secondaryOAMslot] >>> 7) & 1) == 0) {
+            return ((e.ppuSpritePatternTable ? 0x1000 : 0) | (e.ppuSpritePtn[secondaryOAMslot] << 4) | (e.ppuScanline - e.ppuSpritePosY[secondaryOAMslot]))
+        }
+        else {
+            return ((e.ppuSpritePatternTable ? 0x1000 : 0) | (e.ppuSpritePtn[secondaryOAMslot] << 4) | ((7 - (e.ppuScanline - e.ppuSpritePosY[secondaryOAMslot])) & 7))
+        }
+    }
+    // 8x16 sprites
+    else {
+        if (((e.ppuSpriteAtr[secondaryOAMslot] >>> 7) & 1) == 0) {
+            if (ppuScanline - e.ppuSpritePosY[secondaryOAMslot] < 8) {
+                return (((e.ppuSpritePtn[secondaryOAMslot] & 1) == 1) ? 0x1000 : 0) | ((e.ppuSpritePtn[secondaryOAMslot] & 0xFE) << 4) + (e.ppuScanline - e.ppuSpritePosY[secondaryOAMslot])
+            }
+            else {
+                return (((e.ppuSpritePtn[secondaryOAMslot] & 1) == 1) ? 0x1000 : 0) | (((e.ppuSpritePtn[secondaryOAMslot] & 0xFE) << 4) + 16) + ((e.ppuScanline - e.ppuSpritePosY[secondaryOAMslot]) & 7)
+            }
+        }
+        else {
+            if (ppuScanline - e.ppuSpritePosY[secondaryOAMslot] < 8) {
+                return (((e.ppuSpritePtn[secondaryOAMslot] & 1) == 1) ? 0x1000 : 0) | (((e.ppuSpritePtn[secondaryOAMslot] & 0xFE) << 4) + 16) - ((e.ppuScanline - e.ppuSpritePosY[secondaryOAMslot]) & 7) + 7
+            }
+            else {
+                return (((e.ppuSpritePtn[secondaryOAMslot] & 1) == 1) ? 0x1000 : 0) | (((e.ppuSpritePtn[secondaryOAMslot] & 0xFE) << 4) + 7) - ((e.ppuScanline - e.ppuSpritePosY[secondaryOAMslot]) & 7)
+            }
+        }
+    }
+}
+
+function evalSprites(ppuDot, ppuScanline) {
+    if (ppuDot == 0) {
+        e.ppuSecondaryOAMaddr = 0
+        e.ppuSecondaryOAMfull = false
+    }
+    else if (0 < ppuDot && ppuDot <= 64) {
+        if ((ppuDot & 1) == 1) {
+            e.ppuSpriteEvalTemp = 0xFF
+        }
+        else {
+            sys.poke(e.secondaryOAM + (ppuDot >> 1), e.ppuSpriteEvalTemp)
+            e.ppuSecondaryOAMaddr = (e.ppuSecondaryOAMaddr + 1) & 0x1F
+        }
+    }
+    else if (64 < ppuDot && ppuDot <= 256) {
+        if ((ppuDot & 1) == 1) {
+            e.ppuSpriteEvalTemp = sys.peek(e.oam + e.ppuOAMaddr)
+        }
+        else {
+            if (!e.ppuSpriteEvalOAMovf) {
+                if (!e.ppuSecondaryOAMfull) {
+                    sys.poke(e.secondaryOAM + e.ppuSecondaryOAMaddr, e.ppuSpriteEvalTemp)
+                }
+                if (e.ppuSpriteEvalTick == 0) {
+                    if (ppuScanline - e.ppuSpriteEvalTemp >= 0 && ppuScanline - e.ppuSpriteEvalTemp < (e.ppuUse8x16Sprites ? 16 : 8)) {
+                        // this object is on this scanline!
+
+                        if (!e.ppuSecondaryOAMfull) {
+                            e.ppuSecondaryOAMaddr++
+                            e.ppuOAMaddr++
+                            if (ppuDot == 66) {
+                                e.ppuScanlineContainsSprZero = true
+                            }
+                        } else {
+                            e.ppuStatusOverflow = true
+                        }
+                        e.ppuSpriteEvalTick++
+                    } else {
+                        e.ppuOAMaddr += 4
+                    }
+                } else {
+                    e.ppuSecondaryOAMaddr++
+                    e.ppuOAMaddr++
+                    if (e.ppuSecondaryOAMaddr == 0x20) {
+                        e.ppuSecondaryOAMfull = true
+                    }
+                    e.ppuSpriteEvalTick = (e.ppuSpriteEvalTick + 1) & 3
+                }
+                if (e.ppuOAMaddr == 0) {
+                    e.ppuSpriteEvalOAMovf = true
+                }
+            }
+        }
+    }
+    else if (256 < ppuDot && ppuDot <= 320) {
+        e.ppuOAMaddr = 0
+        if (ppuDot == 257) {
+            e.ppuSecondaryOAMsize = e.ppuSecondaryOAMaddr
+            e.ppuSecondaryOAMaddr = 0
+            e.ppuSpriteEValTick = 0
+        }
+
+        let ppuSecondaryOAMaddr = e.ppuSecondaryOAMaddr
+        let ppuSecondaryOAMslot = ppuSecondaryOAMaddr >>> 2
+        let ppuSpriteEvalTemp = 0|0 // every read* function have side effects
+        switch (e.ppuSpriteEvalTick) {
+            case 0:
+                e.ppuSpritePosY[ppuSecondaryOAMslot] = sys.peek(e.secondaryOAM + ppuSecondaryOAMaddr)
+                e.ppuSecondaryOAMaddr = ppuSecondaryOAMaddr + 1
+                break
+            case 1:
+                e.ppuSpritePtn[ppuSecondaryOAMslot] = sys.peek(e.secondaryOAM + ppuSecondaryOAMaddr)
+                e.ppuSecondaryOAMaddr = ppuSecondaryOAMaddr + 1
+                break
+            case 2:
+                e.ppuSpriteAtr[ppuSecondaryOAMslot] = sys.peek(e.secondaryOAM + ppuSecondaryOAMaddr)
+                e.ppuSecondaryOAMaddr = ppuSecondaryOAMaddr + 1
+                break
+            case 3:
+                e.ppuSpritePosX[ppuSecondaryOAMslot] = sys.peek(e.secondaryOAM + ppuSecondaryOAMaddr)
+                break
+            case 4:
+                findCHRaddrForSprite(ppuSecondaryOAMslot, ppuScanline)
+                break
+            case 5:
+                ppuSpriteEvalTemp = readPPU(e.ppuAddrBus)
+                if (ppuScanline == 261) {
+                    ppuSpriteEvalTemp = 0
+                }
+                if (((e.ppuSpriteAtr[ppuSecondaryOAMslot] >> 6) & 1) == 0) { // flip x?
+                    // swap order of bits
+                    ppuSpriteEvalTemp = ((ppuSpriteEvalTemp & 0b11110000) >>> 4) | ((ppuSpriteEvalTemp & 0b00001111) << 4)
+                    ppuSpriteEvalTemp = ((ppuSpriteEvalTemp & 0b11001100) >>> 2) | ((ppuSpriteEvalTemp & 0b00110011) << 4)
+                    ppuSpriteEvalTemp = ((ppuSpriteEvalTemp & 0b10101010) >>> 1) | ((ppuSpriteEvalTemp & 0b01010101) << 4)
+                }
+                e.ppuSpriteShiftRegL[ppuSecondaryOAMslot] = ppuSpriteEvalTemp
+                e.ppuSpriteEvalTemp = ppuSpriteEvalTemp
+                break
+            case 6:
+                e.ppuAddrBus += 8
+                break
+            case 7:
+                ppuSpriteEvalTemp = readPPU(e.ppuAddrBus)
+                if (ppuScanline == 261) {
+                    ppuSpriteEvalTemp = 0
+                }
+                if (((e.ppuSpriteAtr[ppuSecondaryOAMslot] >> 6) & 1) == 0) { // flip x?
+                    // swap order of bits
+                    ppuSpriteEvalTemp = ((ppuSpriteEvalTemp & 0b11110000) >>> 4) | ((ppuSpriteEvalTemp & 0b00001111) << 4)
+                    ppuSpriteEvalTemp = ((ppuSpriteEvalTemp & 0b11001100) >>> 2) | ((ppuSpriteEvalTemp & 0b00110011) << 4)
+                    ppuSpriteEvalTemp = ((ppuSpriteEvalTemp & 0b10101010) >>> 1) | ((ppuSpriteEvalTemp & 0b01010101) << 4)
+                }
+                e.ppuSpriteShiftRegH[ppuSecondaryOAMslot] = ppuSpriteEvalTemp
+                e.ppuSpriteEvalTemp = ppuSpriteEvalTemp
+                e.ppuSecondaryOAMaddr = ppuSecondaryOAMaddr + 1
+                break
+        }
+
+        e.ppuSpriteEvalTick = (e.ppuSpriteEvalTick + 1) & 7
+    }
+}
+
 function emulatePPU() {
     let ppuDot = e.ppuDot // latch
     let ppuScanline = e.ppuScanline
@@ -1386,6 +1600,8 @@ function emulatePPU() {
     }
     else if (ppuDot == 1 && ppuScanline == 261) {
         e.ppuVblank = false
+        e.ppuStatusOverflow = false
+        e.ppuStatusSprZeroHit = false
     }
 
     // is it visible or pre-render scanline
@@ -1400,6 +1616,21 @@ function emulatePPU() {
                     e.ppuShiftRegAtrL = (e.ppuShiftRegAtrL << 1) & 0xFFFF
                     e.ppuShiftRegAtrH = (e.ppuShiftRegAtrH << 1) & 0xFFFF
                 }
+                if (e.ppuMaskRenderBG || e.ppuMaskRenderSprites) {
+                    if (1 < ppuDot && ppuDot <= 256) {
+                        for (let i = 0; i < 8; i++) {
+                            if (e.ppuSpritePosX[i] > 0) {
+                                e.ppuSpritePosX[i] = e.ppuSpritePosX[i] - 1
+                            }
+                            else {
+                                e.ppuSpriteShiftRegL[i] = e.ppuSpriteShiftRegL[i] << 1
+                                e.ppuSpriteShiftRegH[i] = e.ppuSpriteShiftRegH[i] << 1
+                            }
+                        }
+                    }
+                }
+
+                evalSprites(ppuDot, ppuScanline)
 
                 let cycleTick = (ppuDot - 1) & 7
                 let vramAddr = e.vramAddr
@@ -1482,7 +1713,41 @@ function emulatePPU() {
             }
         }
 
+        let spritePalHi = 0
+        let spritePalLo = 0
+        let spritePriority = false
+        if (e.ppuMaskRenderSprites && (ppuDot > 8 || e.ppuMask8pxMaskSprites)) {
+            for (let i = 0; i < 8; i++) {
+                if (e.ppuSpritePosX[i] == 0 && i < (e.ppuSecondaryOAMsize >>> 2)) {
+                    let sPixelL = ((e.ppuSpriteShiftRegL[i]) & 0x80) != 0
+                    let sPixelH = ((e.ppuSpriteShiftRegH[i]) & 0x80) != 0
+                    spritePalLo = 0
+                    if (sPixelL) spritePalLo = 1;
+                    if (sPixelH) spritePalLo |= 2;
+
+                    spritePalHi = ((e.ppuSpriteAtr[i]) & 0x03) | 0x04
+                    spritePriority = ((e.ppuSpriteAtr[i] >> 5) & 1) == 0
+                }
+                else {
+                    continue
+                }
+                if (spritePalLo != 0) {
+                    if (i == 0 && e.ppuScanlineContainsSprZero && spritePalLo != 0 && palLo != 0 && e.ppuMaskRenderBG && ppuDot < 256) {
+                        e.ppuStatusSprZeroHit = true
+                    }
+                    break
+                }
+            }
+        }
+
         // render to FB
+        if ((spritePriority && spritePalLo != 0) || palLo == 0) {
+            palLo = spritePalLo
+            palHi = spritePalHi
+            if (palLo == 0) {
+                palHi = 0
+            }
+        }
         let col = sys.peek(e.pal + palHi * 4 + palLo)
         e.plotFB(ppuDot - 1, ppuScanline, col)
     }
@@ -1649,6 +1914,8 @@ function updateButtonStatus() {
         if (key == config.p1r)   status |= (1 << 7)
     }
     e.currentButtonStatus = status
+
+    serial.println("Current controller bit: "+status)
 }
 
 while (!appexit) {
