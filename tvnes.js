@@ -1360,8 +1360,21 @@ function emulateCPU() {
             cycles = 4 + pageCrossed
             break
 
-        // NOP
-        case 0xEA:
+        // 3-byte NOP
+        case 0x0C: case 0x1C: case 0x3C: case 0x5C: case 0x7C: case 0xDC: case 0xFC:
+            e.readPCu16()
+            cycles = 4
+            break
+
+        // 2-byte NOP
+        case 0x04: case 0x14: case 0x34: case 0x44: case 0x54: case 0x80:
+        case 0x89: case 0x82: case 0xD4: case 0xC2: case 0xF4: case 0xE2:
+            e.readPC()
+            cycles = 2 + (opcode & 0x1F == 0x04) ? 1 : (opcode & 0x1F == 0x14) ? 2 : 0
+            break
+
+        // 1-byte NOP
+        case 0x1A: case 0x3A: case 0x5A: case 0x7A: case 0xDA: case 0xEA: case 0xFA:
             cycles = 2
             break
 
