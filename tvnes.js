@@ -338,11 +338,13 @@ function write(offset0, value) {
 }
 
 function push(value) {
-    write(0x100 + e.sp--, value)
+    write(0x100 + e.sp, value)
+    e.sp = (e.sp - 1) & 0xFF
 }
 
 function pull() {
-    return read(0x100 + ++e.sp)
+    e.sp = (e.sp + 1) & 0xFF
+    return read(0x100 + e.sp)
 }
 
 function pullu16() {
@@ -1389,6 +1391,7 @@ function emulateCPU() {
             if ((Math.random()*64)|0 < 1) e.fZero = !e.fZero;
             if ((Math.random()*64)|0 < 1) e.fNeg = !e.fNeg;
             cycles = 2
+            break
 
         // HLT (unofficial)
         case 0x02:
@@ -1397,7 +1400,7 @@ function emulateCPU() {
 
         default:
             // unknown opcode
-            printerrln(`Illegal opcode ${opcode.toString(16)} at PC ${(e.pc - 1).toString(16)}`)
+            serial.println(`Illegal opcode ${opcode.toString(16)} at PC ${(e.pc - 1).toString(16)}`)
             e.halted = true
             break
     }
@@ -1483,13 +1486,20 @@ function evalSprites(ppuDot, ppuScanline) {
         }
     }
     else if (64 < ppuDot && ppuDot <= 256) {
+        if (ppuDot == 65) {
+            // reset per-scanline state before evaluation begins (matches C# reference dot 65)
+            e.ppuScanlineContainsSprZero = false
+            e.ppuSecondaryOAMaddr = 0
+            e.ppuSpriteEvalTick = 0
+            e.ppuSpriteEvalOAMovf = false
+        }
         if ((ppuDot & 1) == 1) {
-            e.ppuSpriteEvalTemp = sys.peek(e.oam + e.ppuOAMaddr)
+            e.ppuSpriteEvalTemp = sys.peek(e.oam + (e.ppuOAMaddr & 0xFF))
         }
         else {
             if (!e.ppuSpriteEvalOAMovf) {
                 if (!e.ppuSecondaryOAMfull) {
-                    sys.poke(e.secondaryOAM + e.ppuSecondaryOAMaddr, e.ppuSpriteEvalTemp)
+                    sys.poke(e.secondaryOAM + (e.ppuSecondaryOAMaddr & 0x1F), e.ppuSpriteEvalTemp)
                 }
                 if (e.ppuSpriteEvalTick == 0) {
                     if (ppuScanline - e.ppuSpriteEvalTemp >= 0 && ppuScanline - e.ppuSpriteEvalTemp < (e.ppuUse8x16Sprites ? 16 : 8)) {
@@ -1516,7 +1526,8 @@ function evalSprites(ppuDot, ppuScanline) {
                     }
                     e.ppuSpriteEvalTick = (e.ppuSpriteEvalTick + 1) & 3
                 }
-                if (e.ppuOAMaddr == 0) {
+                if (e.ppuOAMaddr >= 0x100) {
+                    e.ppuOAMaddr = 0
                     e.ppuSpriteEvalOAMovf = true
                 }
             }
@@ -1527,7 +1538,7 @@ function evalSprites(ppuDot, ppuScanline) {
         if (ppuDot == 257) {
             e.ppuSecondaryOAMsize = e.ppuSecondaryOAMaddr
             e.ppuSecondaryOAMaddr = 0
-            e.ppuSpriteEValTick = 0
+            e.ppuSpriteEvalTick = 0
         }
 
         let ppuSecondaryOAMaddr = e.ppuSecondaryOAMaddr
@@ -1550,35 +1561,35 @@ function evalSprites(ppuDot, ppuScanline) {
                 e.ppuSpritePosX[ppuSecondaryOAMslot] = sys.peek(e.secondaryOAM + ppuSecondaryOAMaddr)
                 break
             case 4:
-                findCHRaddrForSprite(ppuSecondaryOAMslot, ppuScanline)
+                e.ppuAddrBus = findCHRaddrForSprite(ppuSecondaryOAMslot, ppuScanline)
                 break
             case 5:
                 ppuSpriteEvalTemp = readPPU(e.ppuAddrBus)
                 if (ppuScanline == 261) {
                     ppuSpriteEvalTemp = 0
                 }
-                if (((e.ppuSpriteAtr[ppuSecondaryOAMslot] >> 6) & 1) == 0) { // flip x?
-                    // swap order of bits
+                if (((e.ppuSpriteAtr[ppuSecondaryOAMslot] >>> 6) & 1) == 1) { // flip x?
+                    // reverse the 8 bits
                     ppuSpriteEvalTemp = ((ppuSpriteEvalTemp & 0b11110000) >>> 4) | ((ppuSpriteEvalTemp & 0b00001111) << 4)
-                    ppuSpriteEvalTemp = ((ppuSpriteEvalTemp & 0b11001100) >>> 2) | ((ppuSpriteEvalTemp & 0b00110011) << 4)
-                    ppuSpriteEvalTemp = ((ppuSpriteEvalTemp & 0b10101010) >>> 1) | ((ppuSpriteEvalTemp & 0b01010101) << 4)
+                    ppuSpriteEvalTemp = ((ppuSpriteEvalTemp & 0b11001100) >>> 2) | ((ppuSpriteEvalTemp & 0b00110011) << 2)
+                    ppuSpriteEvalTemp = ((ppuSpriteEvalTemp & 0b10101010) >>> 1) | ((ppuSpriteEvalTemp & 0b01010101) << 1)
                 }
                 e.ppuSpriteShiftRegL[ppuSecondaryOAMslot] = ppuSpriteEvalTemp
                 e.ppuSpriteEvalTemp = ppuSpriteEvalTemp
                 break
             case 6:
-                e.ppuAddrBus += 8
+                e.ppuAddrBus = (e.ppuAddrBus + 8) & 0x3FFF
                 break
             case 7:
                 ppuSpriteEvalTemp = readPPU(e.ppuAddrBus)
                 if (ppuScanline == 261) {
                     ppuSpriteEvalTemp = 0
                 }
-                if (((e.ppuSpriteAtr[ppuSecondaryOAMslot] >> 6) & 1) == 0) { // flip x?
-                    // swap order of bits
+                if (((e.ppuSpriteAtr[ppuSecondaryOAMslot] >>> 6) & 1) == 1) { // flip x?
+                    // reverse the 8 bits
                     ppuSpriteEvalTemp = ((ppuSpriteEvalTemp & 0b11110000) >>> 4) | ((ppuSpriteEvalTemp & 0b00001111) << 4)
-                    ppuSpriteEvalTemp = ((ppuSpriteEvalTemp & 0b11001100) >>> 2) | ((ppuSpriteEvalTemp & 0b00110011) << 4)
-                    ppuSpriteEvalTemp = ((ppuSpriteEvalTemp & 0b10101010) >>> 1) | ((ppuSpriteEvalTemp & 0b01010101) << 4)
+                    ppuSpriteEvalTemp = ((ppuSpriteEvalTemp & 0b11001100) >>> 2) | ((ppuSpriteEvalTemp & 0b00110011) << 2)
+                    ppuSpriteEvalTemp = ((ppuSpriteEvalTemp & 0b10101010) >>> 1) | ((ppuSpriteEvalTemp & 0b01010101) << 1)
                 }
                 e.ppuSpriteShiftRegH[ppuSecondaryOAMslot] = ppuSpriteEvalTemp
                 e.ppuSpriteEvalTemp = ppuSpriteEvalTemp
@@ -1606,6 +1617,13 @@ function emulatePPU() {
 
     // is it visible or pre-render scanline
     if (ppuScanline < 240 || ppuScanline == 261) {
+        // Sprite evaluation runs across the full scanline (dots 0..320). The
+        // eval function itself dispatches on the dot range, so call it
+        // unconditionally here, matching the C# reference's structure.
+        if (e.ppuMaskRenderBG || e.ppuMaskRenderSprites) {
+            evalSprites(ppuDot, ppuScanline)
+        }
+
         if ((0 < ppuDot && ppuDot <= 256) || (320 < ppuDot && ppuDot <= 336)) {
             // if rendering is enabled
             if (e.ppuMaskRenderBG || e.ppuMaskRenderSprites) {
@@ -1616,21 +1634,17 @@ function emulatePPU() {
                     e.ppuShiftRegAtrL = (e.ppuShiftRegAtrL << 1) & 0xFFFF
                     e.ppuShiftRegAtrH = (e.ppuShiftRegAtrH << 1) & 0xFFFF
                 }
-                if (e.ppuMaskRenderBG || e.ppuMaskRenderSprites) {
-                    if (1 < ppuDot && ppuDot <= 256) {
-                        for (let i = 0; i < 8; i++) {
-                            if (e.ppuSpritePosX[i] > 0) {
-                                e.ppuSpritePosX[i] = e.ppuSpritePosX[i] - 1
-                            }
-                            else {
-                                e.ppuSpriteShiftRegL[i] = e.ppuSpriteShiftRegL[i] << 1
-                                e.ppuSpriteShiftRegH[i] = e.ppuSpriteShiftRegH[i] << 1
-                            }
+                if (1 <= ppuDot && ppuDot <= 256) {
+                    for (let i = 0; i < 8; i++) {
+                        if (e.ppuSpritePosX[i] > 0) {
+                            e.ppuSpritePosX[i] = e.ppuSpritePosX[i] - 1
+                        }
+                        else {
+                            e.ppuSpriteShiftRegL[i] = e.ppuSpriteShiftRegL[i] << 1
+                            e.ppuSpriteShiftRegH[i] = e.ppuSpriteShiftRegH[i] << 1
                         }
                     }
                 }
-
-                evalSprites(ppuDot, ppuScanline)
 
                 let cycleTick = (ppuDot - 1) & 7
                 let vramAddr = e.vramAddr
@@ -1918,7 +1932,7 @@ function updateButtonStatus() {
     serial.println("Current controller bit: "+status)
 }
 
-while (!appexit) {
+while (!appexit && !e.halted) {
     sys.poke(-40, 1)
     let keyCode = sys.peek(-41)
 
