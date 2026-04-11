@@ -1391,7 +1391,7 @@ function emulateCPU() {
             cycles = 2
             break
 
-        // XAA aka ANE
+        // XAA aka ANE (unofficial)
         case 0x8B:
             // many different 6502 variations show different results
             // this code roughly follows MOS C01437706 0782 / 6502 KOREA 5231 07 03-82
@@ -1408,8 +1408,9 @@ function emulateCPU() {
             cycles = 2
             break
 
-        // HLT (unofficial)
-        case 0x02:
+        // HLT aka KIL aka JAM (unofficial)
+        case 0x02: case 0x12: case 0x22: case 0x32: case 0x42: case 0x52:
+        case 0x62: case 0x72: case 0x92: case 0xB2: case 0xD2: case 0xF2:
             e.halted = true
             break
 
