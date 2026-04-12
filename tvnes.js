@@ -607,11 +607,16 @@ function run() {
     // reducing calls from ~10k/frame to ~262/frame (one per scanline).
     let ppuBudget = ppu_cycleBudget
     while (!cpu_halted) {
+        let t0 = sys.nanoTime()
         emulateCPU()
+        prof_cpu += sys.nanoTime() - t0
+
         ppuBudget += cycles * 3
         if (ppuBudget >= 341) {
             ppu_cycleBudget = ppuBudget
+            let t1 = sys.nanoTime()
             stepPPU()
+            prof_ppu += sys.nanoTime() - t1
             ppuBudget = ppu_cycleBudget  // stepPPU zeroes it after consuming
             if (ppu_drawNewFrame) {
                 ppu_drawNewFrame = false
@@ -1144,7 +1149,7 @@ function renderScanline(sl) {
     const fbBase    = sl * 256
 
     // Sprite evaluation
-    const sprSlots = evalSpritesForScanline(sl)
+    let _t0 = sys.nanoTime(); const sprSlots = evalSpritesForScanline(sl); prof_ppu_eval += sys.nanoTime() - _t0
     const shL = e.ppuSpriteShiftRegL
     const shH = e.ppuSpriteShiftRegH
     const sAtr = e.ppuSpriteAtr
@@ -1152,6 +1157,7 @@ function renderScanline(sl) {
     const sprZeroThisSl = e.ppuScanlineContainsSprZero
 
     // Fetch 33 BG tiles (33 = 32 visible + 1 extra for fine-X overflow)
+    let _t1 = sys.nanoTime()
     if (renderBG) {
         let va = e.vramAddr
         const highPT = e.ppuBGPatternTable
@@ -1176,7 +1182,10 @@ function renderScanline(sl) {
         }
     }
 
+    prof_ppu_bgfetch += sys.nanoTime() - _t1
+
     // Pixel loop
+    let _t2 = sys.nanoTime()
     for (let dot = 0; dot < 256; dot++) {
         // BG pixel
         let palLo = 0, palHi = 0
@@ -1224,6 +1233,7 @@ function renderScanline(sl) {
 
         if (!skip) fbArr[fbBase + dot] = palArr[finalHi * 4 + finalLo]
     }
+    prof_ppu_pixels += sys.nanoTime() - _t2
 }
 
 // ── Item 3: PPU budget driver (replaces per-dot emulatePPU) ──
@@ -1411,6 +1421,12 @@ function updateButtonStatus() {
     e.currentButtonStatus = status
 }
 
+// ── Profiler — cumulative ns per section, printed every PROF_INTERVAL rendered frames ──
+const PROF_INTERVAL = 60  // print once per ~60 rendered frames
+let prof_cpu = 0, prof_ppu = 0, prof_render = 0, prof_frames = 0
+let prof_ppu_eval = 0, prof_ppu_bgfetch = 0, prof_ppu_pixels = 0
+let prof_wallStart = sys.nanoTime()
+
 // ── Item 8: main loop with frameskip ──
 let frameCounter = 0
 while (!appexit && !cpu_halted) {
@@ -1433,8 +1449,32 @@ while (!appexit && !cpu_halted) {
     run()
 
     if (!ppu_skipRender) {
+        let t2 = sys.nanoTime()
         render()
+        prof_render += sys.nanoTime() - t2
         if (traceFile) traceFile.flush()
+
+        prof_frames++
+        if (prof_frames % PROF_INTERVAL == 0) {
+            let wall = sys.nanoTime() - prof_wallStart
+            let fps  = (prof_frames * 1e9 / wall + 0.5) | 0
+            let total = prof_cpu + prof_ppu + prof_render
+            let pctCPU    = total > 0 ? ((prof_cpu    * 100 / total + 0.5) | 0) : 0
+            let pctPPU    = total > 0 ? ((prof_ppu    * 100 / total + 0.5) | 0) : 0
+            let pctRender = total > 0 ? ((prof_render * 100 / total + 0.5) | 0) : 0
+            let msPerFrame = total > 0 ? ((total / prof_frames / 1e6 * 10 + 0.5) | 0) / 10 : 0
+            // PPU sub-breakdown (percentages of prof_ppu)
+            let ppuOther = prof_ppu - prof_ppu_eval - prof_ppu_bgfetch - prof_ppu_pixels
+            let pp = prof_ppu > 0
+            let pctEval   = pp ? ((prof_ppu_eval    * 100 / prof_ppu + 0.5) | 0) : 0
+            let pctBG     = pp ? ((prof_ppu_bgfetch * 100 / prof_ppu + 0.5) | 0) : 0
+            let pctPx     = pp ? ((prof_ppu_pixels  * 100 / prof_ppu + 0.5) | 0) : 0
+            let pctOther  = pp ? ((ppuOther          * 100 / prof_ppu + 0.5) | 0) : 0
+            serial.println(`[prof] ${fps} fps | ${msPerFrame}ms/frame | CPU:${pctCPU}% PPU:${pctPPU}%(eval:${pctEval}% bg:${pctBG}% px:${pctPx}% misc:${pctOther}%) render:${pctRender}%`)
+            prof_cpu = 0; prof_ppu = 0; prof_render = 0; prof_frames = 0
+            prof_ppu_eval = 0; prof_ppu_bgfetch = 0; prof_ppu_pixels = 0
+            prof_wallStart = sys.nanoTime()
+        }
     }
 }
 
