@@ -684,12 +684,13 @@ let temp   = 0
 let pageCrossed = false
 
 function doBranchingOnPredicate(p) {
-    let sv = readPCs()
-    let oldPCh = cpu_pc >>> 8
+    // Inlined readPCs sign-extend + movPC — saves 2 nested calls
+    let off = readPC()
     if (p) {
-        movPC(sv)
-        let newPCh = cpu_pc >>> 8
-        cycles = 3 + ((oldPCh != newPCh) ? 1 : 0)
+        if (off > 127) off -= 256  // sign-extend
+        let oldPCh = cpu_pc >>> 8
+        cpu_pc = (cpu_pc + off) & 0xFFFF
+        cycles = 3 + ((oldPCh !== (cpu_pc >>> 8)) ? 1 : 0)
     } else {
         cycles = 2
     }
@@ -824,8 +825,8 @@ function emulateCPU() {
 
         // ORA
         case 0x01: cpu_a = cpu_a | read(addrIndX()); cpu_fZ = cpu_a==0; cpu_fN = cpu_a>127; cycles = 6; break
-        case 0x05: cpu_a = cpu_a | read(readPC());    cpu_fZ = cpu_a==0; cpu_fN = cpu_a>127; cycles = 3; break
-        case 0x09: cpu_a = cpu_a | readPC();           cpu_fZ = cpu_a==0; cpu_fN = cpu_a>127; cycles = 2; break
+        case 0x05: cpu_a |= ramArr[readPC()]; cpu_fZ = cpu_a==0; cpu_fN = cpu_a>127; cycles = 3; break
+        case 0x09: cpu_a |= readPC(); cpu_fZ = cpu_a==0; cpu_fN = cpu_a>127; cycles = 2; break
         case 0x0D: cpu_a = cpu_a | read(readPCu16());  cpu_fZ = cpu_a==0; cpu_fN = cpu_a>127; cycles = 4; break
         case 0x11: cpu_a = cpu_a | read(addrIndY());   cpu_fZ = cpu_a==0; cpu_fN = cpu_a>127; cycles = 5 + pageCrossed; break
         case 0x15: cpu_a = cpu_a | read(addrZpX());    cpu_fZ = cpu_a==0; cpu_fN = cpu_a>127; cycles = 4; break
@@ -833,7 +834,7 @@ function emulateCPU() {
         case 0x1D: cpu_a = cpu_a | read(addrAbsX());   cpu_fZ = cpu_a==0; cpu_fN = cpu_a>127; cycles = 4 + pageCrossed; break
 
         // ASL
-        case 0x0A: cpu_a = doASL(cpu_a); cycles = 2; break
+        case 0x0A: cpu_fC = (cpu_a&0x80)!=0; cpu_a=(cpu_a<<1)&0xFF; cpu_fZ = cpu_a==0; cpu_fN = cpu_a>127; cycles = 2; break
         case 0x06: temp = readPC();    write(temp, doASL(read(temp))); cycles = 5; break
         case 0x16: temp = addrZpX();   write(temp, doASL(read(temp))); cycles = 6; break
         case 0x0E: temp = readPCu16(); write(temp, doASL(read(temp))); cycles = 6; break
@@ -848,8 +849,8 @@ function emulateCPU() {
 
         // AND
         case 0x21: cpu_a = cpu_a & read(addrIndX()); cpu_fZ = cpu_a==0; cpu_fN = cpu_a>127; cycles = 6; break
-        case 0x25: cpu_a = cpu_a & read(readPC());    cpu_fZ = cpu_a==0; cpu_fN = cpu_a>127; cycles = 3; break
-        case 0x29: cpu_a = cpu_a & readPC();           cpu_fZ = cpu_a==0; cpu_fN = cpu_a>127; cycles = 2; break
+        case 0x25: cpu_a &= ramArr[readPC()]; cpu_fZ = cpu_a==0; cpu_fN = cpu_a>127; cycles = 3; break
+        case 0x29: cpu_a &= readPC(); cpu_fZ = cpu_a==0; cpu_fN = cpu_a>127; cycles = 2; break
         case 0x2D: cpu_a = cpu_a & read(readPCu16());  cpu_fZ = cpu_a==0; cpu_fN = cpu_a>127; cycles = 4; break
         case 0x31: cpu_a = cpu_a & read(addrIndY());   cpu_fZ = cpu_a==0; cpu_fN = cpu_a>127; cycles = 5 + pageCrossed; break
         case 0x35: cpu_a = cpu_a & read(addrZpX());    cpu_fZ = cpu_a==0; cpu_fN = cpu_a>127; cycles = 4; break
@@ -857,11 +858,11 @@ function emulateCPU() {
         case 0x3D: cpu_a = cpu_a & read(addrAbsX());   cpu_fZ = cpu_a==0; cpu_fN = cpu_a>127; cycles = 4 + pageCrossed; break
 
         // BIT
-        case 0x24: temp = read(readPC());    cpu_fZ = (cpu_a & temp)==0; cpu_fV = (temp&0x40)!=0; cpu_fN = (temp&0x80)!=0; cycles = 3; break
+        case 0x24: temp = ramArr[readPC()]; cpu_fZ = (cpu_a & temp)==0; cpu_fV = (temp&0x40)!=0; cpu_fN = (temp&0x80)!=0; cycles = 3; break
         case 0x2C: temp = read(readPCu16()); cpu_fZ = (cpu_a & temp)==0; cpu_fV = (temp&0x40)!=0; cpu_fN = (temp&0x80)!=0; cycles = 4; break
 
         // ROL
-        case 0x2A: cpu_a = doROL(cpu_a); cycles = 2; break
+        case 0x2A: { let c=cpu_fC?1:0; cpu_fC=(cpu_a&0x80)!=0; cpu_a=((cpu_a<<1)|c)&0xFF; cpu_fZ=cpu_a==0; cpu_fN=cpu_a>127; cycles=2; break }
         case 0x26: temp = readPC();    write(temp, doROL(read(temp))); cycles = 5; break
         case 0x36: temp = addrZpX();   write(temp, doROL(read(temp))); cycles = 6; break
         case 0x2E: temp = readPCu16(); write(temp, doROL(read(temp))); cycles = 6; break
@@ -876,8 +877,8 @@ function emulateCPU() {
 
         // EOR
         case 0x41: cpu_a = cpu_a ^ read(addrIndX()); cpu_fZ = cpu_a==0; cpu_fN = cpu_a>127; cycles = 6; break
-        case 0x45: cpu_a = cpu_a ^ read(readPC());    cpu_fZ = cpu_a==0; cpu_fN = cpu_a>127; cycles = 3; break
-        case 0x49: cpu_a = cpu_a ^ readPC();           cpu_fZ = cpu_a==0; cpu_fN = cpu_a>127; cycles = 2; break
+        case 0x45: cpu_a ^= ramArr[readPC()]; cpu_fZ = cpu_a==0; cpu_fN = cpu_a>127; cycles = 3; break
+        case 0x49: cpu_a ^= readPC(); cpu_fZ = cpu_a==0; cpu_fN = cpu_a>127; cycles = 2; break
         case 0x4D: cpu_a = cpu_a ^ read(readPCu16());  cpu_fZ = cpu_a==0; cpu_fN = cpu_a>127; cycles = 4; break
         case 0x51: cpu_a = cpu_a ^ read(addrIndY());   cpu_fZ = cpu_a==0; cpu_fN = cpu_a>127; cycles = 5 + pageCrossed; break
         case 0x55: cpu_a = cpu_a ^ read(addrZpX());    cpu_fZ = cpu_a==0; cpu_fN = cpu_a>127; cycles = 4; break
@@ -885,7 +886,7 @@ function emulateCPU() {
         case 0x5D: cpu_a = cpu_a ^ read(addrAbsX());   cpu_fZ = cpu_a==0; cpu_fN = cpu_a>127; cycles = 4 + pageCrossed; break
 
         // LSR
-        case 0x4A: cpu_a = doLSR(cpu_a); cycles = 2; break
+        case 0x4A: cpu_fC = (cpu_a&1)!=0; cpu_a>>>=1; cpu_fZ = cpu_a==0; cpu_fN = false; cycles = 2; break
         case 0x46: temp = readPC();    write(temp, doLSR(read(temp))); cycles = 5; break
         case 0x56: temp = addrZpX();   write(temp, doLSR(read(temp))); cycles = 6; break
         case 0x4E: temp = readPCu16(); write(temp, doLSR(read(temp))); cycles = 6; break
@@ -903,8 +904,8 @@ function emulateCPU() {
 
         // ADC
         case 0x61: doADC(read(addrIndX())); cycles = 6; break
-        case 0x65: doADC(read(readPC()));    cycles = 3; break
-        case 0x69: doADC(readPC());           cycles = 2; break
+        case 0x65: doADC(ramArr[readPC()]); cycles = 3; break
+        case 0x69: doADC(readPC()); cycles = 2; break
         case 0x6D: doADC(read(readPCu16()));  cycles = 4; break
         case 0x71: doADC(read(addrIndY()));   cycles = 5 + pageCrossed; break
         case 0x75: doADC(read(addrZpX()));    cycles = 4; break
@@ -912,7 +913,7 @@ function emulateCPU() {
         case 0x7D: doADC(read(addrAbsX()));   cycles = 4 + pageCrossed; break
 
         // ROR
-        case 0x6A: cpu_a = doROR(cpu_a); cycles = 2; break
+        case 0x6A: { let c=cpu_fC?128:0; cpu_fC=(cpu_a&1)!=0; cpu_a=(cpu_a>>>1)|c; cpu_fZ=cpu_a==0; cpu_fN=cpu_a>127; cycles=2; break }
         case 0x66: temp = readPC();    write(temp, doROR(read(temp))); cycles = 5; break
         case 0x76: temp = addrZpX();   write(temp, doROR(read(temp))); cycles = 6; break
         case 0x6E: temp = readPCu16(); write(temp, doROR(read(temp))); cycles = 6; break
@@ -924,20 +925,20 @@ function emulateCPU() {
 
         // STA
         case 0x81: write(addrIndX(), cpu_a); cycles = 6; break
-        case 0x85: write(readPC(),   cpu_a); cycles = 3; break
-        case 0x8D: write(readPCu16(), cpu_a); cycles = 4; break
+        case 0x85: ramArr[readPC()] = cpu_a; cycles = 3; break
+        case 0x8D: { let a=readPCu16(); if(a<0x2000)ramArr[a&0x7FF]=cpu_a; else write(a,cpu_a); cycles=4; break }
         case 0x91: write(addrIndY(), cpu_a); cycles = 6; break
         case 0x95: write(addrZpX(),  cpu_a); cycles = 4; break
         case 0x99: write(addrAbsY(), cpu_a); cycles = 5; break
         case 0x9D: write(addrAbsX(), cpu_a); cycles = 5; break
 
         // STY
-        case 0x84: write(readPC(),    cpu_y); cycles = 3; break
+        case 0x84: ramArr[readPC()] = cpu_y; cycles = 3; break
         case 0x8C: write(readPCu16(), cpu_y); cycles = 4; break
         case 0x94: write(addrZpX(),   cpu_y); cycles = 4; break
 
         // STX
-        case 0x86: write(readPC(),    cpu_x); cycles = 3; break
+        case 0x86: ramArr[readPC()] = cpu_x; cycles = 3; break
         case 0x8E: write(readPCu16(), cpu_x); cycles = 4; break
         case 0x96: write(addrZpY(),   cpu_x); cycles = 4; break
 
@@ -948,25 +949,25 @@ function emulateCPU() {
         case 0x9A: cpu_sp = cpu_x; cycles = 2; break  // TXS
 
         // LDY
-        case 0xA0: cpu_y = readPC();           cpu_fZ = cpu_y==0; cpu_fN = cpu_y>127; cycles = 2; break
-        case 0xA4: cpu_y = read(readPC());     cpu_fZ = cpu_y==0; cpu_fN = cpu_y>127; cycles = 3; break
+        case 0xA0: cpu_y = readPC(); cpu_fZ = cpu_y==0; cpu_fN = cpu_y>127; cycles = 2; break
+        case 0xA4: cpu_y = ramArr[readPC()]; cpu_fZ = cpu_y==0; cpu_fN = cpu_y>127; cycles = 3; break
         case 0xAC: cpu_y = read(readPCu16());  cpu_fZ = cpu_y==0; cpu_fN = cpu_y>127; cycles = 4; break
         case 0xB4: cpu_y = read(addrZpX());    cpu_fZ = cpu_y==0; cpu_fN = cpu_y>127; cycles = 4; break
         case 0xBC: cpu_y = read(addrAbsX());   cpu_fZ = cpu_y==0; cpu_fN = cpu_y>127; cycles = 4 + pageCrossed; break
 
         // LDA
         case 0xA1: cpu_a = read(addrIndX()); cpu_fZ = cpu_a==0; cpu_fN = cpu_a>127; cycles = 6; break
-        case 0xA5: cpu_a = read(readPC());    cpu_fZ = cpu_a==0; cpu_fN = cpu_a>127; cycles = 3; break
-        case 0xA9: cpu_a = readPC();           cpu_fZ = cpu_a==0; cpu_fN = cpu_a>127; cycles = 2; break
-        case 0xAD: cpu_a = read(readPCu16());  cpu_fZ = cpu_a==0; cpu_fN = cpu_a>127; cycles = 4; break
+        case 0xA5: cpu_a = ramArr[readPC()]; cpu_fZ = cpu_a==0; cpu_fN = cpu_a>127; cycles = 3; break
+        case 0xA9: cpu_a = readPC(); cpu_fZ = cpu_a==0; cpu_fN = cpu_a>127; cycles = 2; break
+        case 0xAD: { let a=readPCu16(); cpu_a=a<0x2000?ramArr[a&0x7FF]:read(a); cpu_fZ=cpu_a==0; cpu_fN=cpu_a>127; cycles=4; break }
         case 0xB1: cpu_a = read(addrIndY());   cpu_fZ = cpu_a==0; cpu_fN = cpu_a>127; cycles = 5 + pageCrossed; break
         case 0xB5: cpu_a = read(addrZpX());    cpu_fZ = cpu_a==0; cpu_fN = cpu_a>127; cycles = 4; break
         case 0xB9: cpu_a = read(addrAbsY());   cpu_fZ = cpu_a==0; cpu_fN = cpu_a>127; cycles = 4 + pageCrossed; break
         case 0xBD: cpu_a = read(addrAbsX());   cpu_fZ = cpu_a==0; cpu_fN = cpu_a>127; cycles = 4 + pageCrossed; break
 
         // LDX
-        case 0xA2: cpu_x = readPC();           cpu_fZ = cpu_x==0; cpu_fN = cpu_x>127; cycles = 2; break
-        case 0xA6: cpu_x = read(readPC());     cpu_fZ = cpu_x==0; cpu_fN = cpu_x>127; cycles = 3; break
+        case 0xA2: cpu_x = readPC(); cpu_fZ = cpu_x==0; cpu_fN = cpu_x>127; cycles = 2; break
+        case 0xA6: cpu_x = ramArr[readPC()]; cpu_fZ = cpu_x==0; cpu_fN = cpu_x>127; cycles = 3; break
         case 0xAE: cpu_x = read(readPCu16());  cpu_fZ = cpu_x==0; cpu_fN = cpu_x>127; cycles = 4; break
         case 0xB6: cpu_x = read(addrZpY());    cpu_fZ = cpu_x==0; cpu_fN = cpu_x>127; cycles = 4; break
         case 0xBE: cpu_x = read(addrAbsY());   cpu_fZ = cpu_x==0; cpu_fN = cpu_x>127; cycles = 4 + pageCrossed; break
@@ -978,14 +979,14 @@ function emulateCPU() {
         case 0xBA: cpu_x = cpu_sp; cpu_fZ = cpu_x==0; cpu_fN = cpu_x>127; cycles = 2; break  // TSX
 
         // CPY
-        case 0xC0: doCMP(cpu_y, readPC());           cycles = 2; break
-        case 0xC4: doCMP(cpu_y, read(readPC()));     cycles = 3; break
+        case 0xC0: { let v=readPC(); cpu_fC=cpu_y>=v; cpu_fZ=((cpu_y-v)&0xFF)==0; cpu_fN=((cpu_y-v)&0x80)!=0; cycles=2; break }
+        case 0xC4: { let v=ramArr[readPC()]; cpu_fC=cpu_y>=v; cpu_fZ=((cpu_y-v)&0xFF)==0; cpu_fN=((cpu_y-v)&0x80)!=0; cycles=3; break }
         case 0xCC: doCMP(cpu_y, read(readPCu16()));  cycles = 4; break
 
         // CMP
         case 0xC1: doCMP(cpu_a, read(addrIndX())); cycles = 6; break
-        case 0xC5: doCMP(cpu_a, read(readPC()));    cycles = 3; break
-        case 0xC9: doCMP(cpu_a, readPC());           cycles = 2; break
+        case 0xC5: { let v=ramArr[readPC()]; cpu_fC=cpu_a>=v; cpu_fZ=((cpu_a-v)&0xFF)==0; cpu_fN=((cpu_a-v)&0x80)!=0; cycles=3; break }
+        case 0xC9: { let v=readPC(); cpu_fC=cpu_a>=v; cpu_fZ=((cpu_a-v)&0xFF)==0; cpu_fN=((cpu_a-v)&0x80)!=0; cycles=2; break }
         case 0xCD: doCMP(cpu_a, read(readPCu16()));  cycles = 4; break
         case 0xD1: doCMP(cpu_a, read(addrIndY()));   cycles = 5 + pageCrossed; break
         case 0xD5: doCMP(cpu_a, read(addrZpX()));    cycles = 4; break
@@ -993,8 +994,8 @@ function emulateCPU() {
         case 0xDD: doCMP(cpu_a, read(addrAbsX()));   cycles = 4 + pageCrossed; break
 
         // CPX
-        case 0xE0: doCMP(cpu_x, readPC());           cycles = 2; break
-        case 0xE4: doCMP(cpu_x, read(readPC()));     cycles = 3; break
+        case 0xE0: { let v=readPC(); cpu_fC=cpu_x>=v; cpu_fZ=((cpu_x-v)&0xFF)==0; cpu_fN=((cpu_x-v)&0x80)!=0; cycles=2; break }
+        case 0xE4: { let v=ramArr[readPC()]; cpu_fC=cpu_x>=v; cpu_fZ=((cpu_x-v)&0xFF)==0; cpu_fN=((cpu_x-v)&0x80)!=0; cycles=3; break }
         case 0xEC: doCMP(cpu_x, read(readPCu16()));  cycles = 4; break
 
         // DEC
@@ -1018,7 +1019,7 @@ function emulateCPU() {
 
         // SBC
         case 0xE1: doSBC(read(addrIndX())); cycles = 6; break
-        case 0xE5: doSBC(read(readPC()));    cycles = 3; break
+        case 0xE5: doSBC(ramArr[readPC()]); cycles = 3; break
         case 0xE9: case 0xEB: doSBC(readPC()); cycles = 2; break
         case 0xED: doSBC(read(readPCu16()));   cycles = 4; break
         case 0xF1: doSBC(read(addrIndY()));    cycles = 5 + pageCrossed; break
@@ -1036,8 +1037,8 @@ function emulateCPU() {
         }
 
         // 2-byte NOP (unofficial)
-        case 0x04: case 0x14: case 0x34: case 0x44: case 0x54: case 0x80:
-        case 0x89: case 0x82: case 0xD4: case 0xC2: case 0xF4: case 0xE2:
+        case 0x04: case 0x14: case 0x34: case 0x44: case 0x54: case 0x64: case 0x74:
+        case 0x80: case 0x89: case 0x82: case 0xD4: case 0xC2: case 0xF4: case 0xE2:
             readPC()
             cycles = 2 + ((opcode & 0x1F) == 0x04 ? 1 : ((opcode & 0x1F) == 0x14 ? 2 : 0))
             break
@@ -1071,7 +1072,7 @@ function emulateCPU() {
             break
 
         default:
-            serial.println(`Illegal opcode ${opcode.toString(16)} at PC ${((cpu_pc - 1) & 0xFFFF).toString(16)}`)
+            serial.println(`Illegal opcode $${opcode.toString(16)} at PC $${((cpu_pc - 1) & 0xFFFF).toString(16)}`)
             cpu_halted = true
             break
     }
