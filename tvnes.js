@@ -21,23 +21,12 @@ config.printTracelog = false
 // ── Profiler — cumulative ns per section, printed every PROF_INTERVAL rendered frames ──
 const PROF_INTERVAL = 60  // print once per ~60 rendered frames
 let prof_cpu = 0, prof_ppu = 0, prof_render = 0, prof_frames = 0
-let prof_ppu_eval = 0, prof_ppu_bgfetch = 0, prof_ppu_pixels = 0
 
 // ── CPU sub-profiler (count-based, not timer-based — one cheap ++ per event) ──
 let prof_cpu_instrs  = 0  // instructions executed this window
 let prof_cpu_cycles  = 0  // CPU cycles this window
 let prof_cpu_nmi     = 0  // NMIs fired this window
 let prof_cpu_skip    = 0  // CPU cycles skipped via spin-loop fast-forward
-// read() destination breakdown
-let prof_read_ram    = 0  // CPU RAM   ($0000–$1FFF)
-let prof_read_ppu    = 0  // PPU regs  ($2000–$3FFF)
-let prof_read_apu    = 0  // ctrl/APU  ($4016/$4017)
-let prof_read_rom    = 0  // PRG ROM   ($8000–$FFFF) via read()
-// write() destination breakdown
-let prof_write_ram   = 0  // CPU RAM
-let prof_write_ppu   = 0  // PPU regs
-let prof_write_oam   = 0  // OAM DMA   ($4014)
-let prof_write_apu   = 0  // APU/IO    ($4000–$401F, excl. DMA)
 // Per-opcode execution counts — reset each window; used for hot-instr report
 const prof_opcodeHits = new Uint32Array(256)
 let prof_wallStart = sys.nanoTime()
@@ -62,6 +51,10 @@ e.vramArr = new Uint8Array(0x800)    // 2 KB nametable VRAM (H/V mirrored)
 e.palArr  = new Uint8Array(0x20)     // 32-byte palette RAM
 e.oamArr  = new Uint8Array(0x100)    // 256-byte OAM (sprite attributes)
 e.secondaryOAMArr = new Uint8Array(0x20)
+// Module-level aliases for the hot memory arrays — eliminates e.* property lookup
+// from readPC / readPCu16 / read / write / renderScanline (≈14k dereferences/frame).
+let ramArr = e.ramArr, romArr = e.romArr, chrArr = e.chrArr
+let vramArr = e.vramArr, palArr = e.palArr, oamArr = e.oamArr
 // iNES header (16 bytes)
 e.inesHdr = new Uint8Array(16)
 // ── Item 2: framebuffer as JS typed array; GPU flush done at frame-end ──
@@ -196,7 +189,7 @@ const OPCODE_NAMES = [
 
 function readPC() {
     let pc = cpu_pc
-    let v = pc >= 0x8000 ? e.romArr[pc - 0x8000] : read(pc)
+    let v = pc >= 0x8000 ? romArr[pc - 0x8000] : read(pc)
     cpu_pc = (pc + 1) & 0xFFFF
     return v
 }
@@ -210,8 +203,8 @@ function readPCu16() {
     let pc = cpu_pc
     let lo, hi
     if (pc >= 0x8000) {
-        lo = e.romArr[pc - 0x8000]
-        hi = e.romArr[(pc + 1) - 0x8000]
+        lo = romArr[pc - 0x8000]
+        hi = romArr[(pc + 1) - 0x8000]
     } else {
         lo = read(pc)
         hi = read(pc + 1)
@@ -248,9 +241,9 @@ if (fullFilePath === undefined) {
 // ── Item 1: read() uses typed arrays, zero sys.peek in hot path ──
 function read(offset) {
     // CPU RAM ($0000–$1FFF, 2KB mirrored)
-    if (offset < 0x2000) { prof_read_ram++; return e.ramArr[offset & 0x7FF] }
+    if (offset < 0x2000) return ramArr[offset & 0x7FF]
     // PPU registers ($2000–$3FFF, mirrors of $2000–$2007)
-    if (offset < 0x4000) { prof_read_ppu++;
+    if (offset < 0x4000) {
         offset &= 0x2007
         switch (offset) {
             case 0x2002: { // PPUSTATUS
@@ -278,20 +271,18 @@ function read(offset) {
     }
     // Controller 1 ($4016) — NES shift register sends LSB first (A=bit0, B=bit1, ...)
     if (offset == 0x4016) {
-        prof_read_apu++
         let bit = e.cnt1sr & 1
         e.cnt1sr = e.cnt1sr >>> 1
         return bit
     }
     // Controller 2 ($4017)
     if (offset == 0x4017) {
-        prof_read_apu++
         let bit = e.cnt2sr & 1
         e.cnt2sr = e.cnt2sr >>> 1
         return bit
     }
     // PRG ROM ($8000–$FFFF)
-    if (offset >= 0x8000) { prof_read_rom++; return e.romArr[offset - 0x8000] }
+    if (offset >= 0x8000) return romArr[offset - 0x8000]
     // Unmapped
     return 0
 }
@@ -305,13 +296,9 @@ function readSigned(offset) {
 function write(offset0, value) {
     let offset = offset0 & 0xFFFF
     // CPU RAM ($0000–$1FFF, 2KB mirrored)
-    if (offset < 0x2000) {
-        prof_write_ram++
-        e.ramArr[offset & 0x7FF] = value
-        return
-    }
+    if (offset < 0x2000) { ramArr[offset & 0x7FF] = value; return }
     // PPU registers
-    if (offset < 0x4000) { prof_write_ppu++;
+    if (offset < 0x4000) {
         offset &= 0x2007
         switch (offset) {
             case 0x2000: // PPUCTRL
@@ -339,7 +326,7 @@ function write(offset0, value) {
                 e.ppuOAMaddr = value
                 break
             case 0x2004: // OAMDATA
-                e.oamArr[e.ppuOAMaddr] = value
+                oamArr[e.ppuOAMaddr] = value
                 e.ppuOAMaddr = (e.ppuOAMaddr + 1) & 0xFF
                 break
             case 0x2005: // PPUSCROLL
@@ -369,22 +356,22 @@ function write(offset0, value) {
                 let vramAddr = e.vramAddr
                 if (vramAddr < 0x2000) {
                     // CHR RAM (only if no CHR ROM banks)
-                    if (e.inesHdr[5] == 0) e.chrArr[vramAddr] = value
+                    if (e.inesHdr[5] == 0) chrArr[vramAddr] = value
                 } else if (vramAddr < 0x3F00) {
                     // Nametable VRAM (with mirroring)
                     if ((e.inesHdr[6] & 1) == 0) {
                         // horizontal mirroring
-                        e.vramArr[(vramAddr & 0x3FF) | ((vramAddr & 0x800) >>> 1)] = value
+                        vramArr[(vramAddr & 0x3FF) | ((vramAddr & 0x800) >>> 1)] = value
                     } else {
                         // vertical mirroring
-                        e.vramArr[vramAddr & 0x7FF] = value
+                        vramArr[vramAddr & 0x7FF] = value
                     }
                 } else {
                     // Palette RAM
                     if ((vramAddr & 3) == 0) {
-                        e.palArr[vramAddr & 0x0F] = value
+                        palArr[vramAddr & 0x0F] = value
                     } else {
-                        e.palArr[vramAddr & 0x1F] = value
+                        palArr[vramAddr & 0x1F] = value
                     }
                 }
                 e.vramAddr = (vramAddr + (e.ppuVramInc32Mode ? 32 : 1)) & 0x3FFF
@@ -397,24 +384,24 @@ function write(offset0, value) {
     if (offset < 0x4020) {
         switch (offset) {
             // ── Item 9: OAM DMA with bulk typed-array copy ──
-            case 0x4014: { prof_write_oam++;
+            case 0x4014: {
                 let src = value << 8
                 if (src < 0x2000) {
                     // RAM source — fast path using typed array
                     let base = src & 0x7FF
                     for (let i = 0; i < 256; i++) {
-                        e.oamArr[i] = e.ramArr[(base + i) & 0x7FF]
+                        oamArr[i] = ramArr[(base + i) & 0x7FF]
                     }
                 } else if (src >= 0x8000) {
                     // ROM source (uncommon)
                     let rbase = src - 0x8000
                     for (let i = 0; i < 256; i++) {
-                        e.oamArr[i] = e.romArr[rbase + i]
+                        oamArr[i] = romArr[rbase + i]
                     }
                 } else {
                     // Other sources (slow path, very rare)
                     for (let i = 0; i < 256; i++) {
-                        e.oamArr[i] = read(src + i)
+                        oamArr[i] = read(src + i)
                     }
                 }
                 cycles += 513  // OAM DMA CPU stall
@@ -424,7 +411,7 @@ function write(offset0, value) {
                 e.cnt1sr = e.currentButtonStatus
                 e.cnt2sr = 0
                 break
-            default: prof_write_apu++; break
+            default: break
         }
         return
     }
@@ -433,20 +420,20 @@ function write(offset0, value) {
 
 // Stack is always $0100–$01FF (always in CPU RAM) — bypass read()/write() dispatch.
 function push(value) {
-    e.ramArr[0x100 + cpu_sp] = value
+    ramArr[0x100 + cpu_sp] = value
     cpu_sp = (cpu_sp - 1) & 0xFF
 }
 
 function pull() {
     cpu_sp = (cpu_sp + 1) & 0xFF
-    return e.ramArr[0x100 + cpu_sp]
+    return ramArr[0x100 + cpu_sp]
 }
 
 function pullu16() {
     let sp = (cpu_sp + 1) & 0xFF
-    let lo = e.ramArr[0x100 + sp]
+    let lo = ramArr[0x100 + sp]
     sp = (sp + 1) & 0xFF
-    let hi = e.ramArr[0x100 + sp]
+    let hi = ramArr[0x100 + sp]
     cpu_sp = sp
     return (hi << 8) | lo
 }
@@ -467,7 +454,7 @@ function reset() {
     let prgBanks = e.inesHdr[4]
     let prgSize  = prgBanks * 0x4000
     for (let i = 0; i < 0x8000; i++) {
-        e.romArr[i] = sys.peek(headeredRom + 0x10 + (i % prgSize))
+        romArr[i] = sys.peek(headeredRom + 0x10 + (i % prgSize))
     }
 
     // Copy CHR ROM (if present; if 0 banks, chrArr stays as CHR RAM)
@@ -477,7 +464,7 @@ function reset() {
         let chrSize = chrBanks * 0x2000
         if (chrSize > 0x2000) chrSize = 0x2000
         for (let i = 0; i < chrSize; i++) {
-            e.chrArr[i] = sys.peek(headeredRom + chrOffset + i)
+            chrArr[i] = sys.peek(headeredRom + chrOffset + i)
         }
     }
 
@@ -516,8 +503,8 @@ function reset() {
 // ── Item 11: side-effect-free ROM/RAM read for disassembler ──
 function peekRO(addr) {
     addr &= 0xFFFF
-    if (addr < 0x2000) return e.ramArr[addr & 0x7FF]
-    if (addr >= 0x8000) return e.romArr[addr - 0x8000]
+    if (addr < 0x2000) return ramArr[addr & 0x7FF]
+    if (addr >= 0x8000) return romArr[addr - 0x8000]
     return 0
 }
 
@@ -641,9 +628,11 @@ function run() {
     // stepPPU is only called when the budget reaches a scanline boundary (341 dots),
     // reducing calls from ~10k/frame to ~262/frame (one per scanline).
     let ppuBudget = ppu_cycleBudget
-    // CPU timer sampled only at scanline boundaries (~262×/frame, not ~30k×/frame)
-    let _tCpu = sys.nanoTime()
     let lastPC = -1  // for spin-loop detection
+    // Time the whole run() call once; subtract PPU sub-total to get CPU time.
+    // This halves nanoTime() calls vs stop-start around every scanline boundary.
+    let _tStart = sys.nanoTime()
+    let ppuNs   = 0
 
     while (!cpu_halted) {
         // NMI edge detection (moved here from emulateCPU so spin-loop skip can check it)
@@ -670,21 +659,21 @@ function run() {
         }
 
         if (ppuBudget >= 341) {
-            prof_cpu += sys.nanoTime() - _tCpu
             ppu_cycleBudget = ppuBudget
             let t1 = sys.nanoTime()
             stepPPU()
-            prof_ppu += sys.nanoTime() - t1
+            ppuNs += sys.nanoTime() - t1
             ppuBudget = ppu_cycleBudget  // stepPPU zeroes it after consuming
             if (ppu_drawNewFrame) {
                 ppu_drawNewFrame = false
                 break
             }
             lastPC = -1  // reset after each scanline so the skip doesn't bleed across
-            _tCpu = sys.nanoTime()
         }
     }
-    prof_cpu += sys.nanoTime() - _tCpu  // charge remaining CPU work after last PPU tick
+    let totalNs  = sys.nanoTime() - _tStart
+    prof_ppu    += ppuNs
+    prof_cpu    += totalNs - ppuNs  // CPU = total run time minus PPU sub-time
     ppu_cycleBudget = ppuBudget
     if (cpu_halted) serial.println('CPU Halted')
 }
@@ -709,7 +698,7 @@ function doBranchingOnPredicate(p) {
 // Zero-page is always CPU RAM — bypass read() dispatch.
 function readZpU16(addr) {
     let a = addr & 0xFF
-    return e.ramArr[a] | (e.ramArr[(a + 1) & 0xFF] << 8)
+    return ramArr[a] | (ramArr[(a + 1) & 0xFF] << 8)
 }
 
 function readU16Wrap(addr) {
@@ -804,7 +793,7 @@ function emulateCPU() {
         // ── Item 10: fast opcode fetch from ROM without going through read() ──
         let pc = cpu_pc
         if (pc >= 0x8000) {
-            opcode = e.romArr[pc - 0x8000]
+            opcode = romArr[pc - 0x8000]
             cpu_pc = (pc + 1) & 0xFFFF
         } else {
             opcode = read(pc)
@@ -1096,20 +1085,20 @@ function emulateCPU() {
 // ── Item 1: readPPU uses typed arrays ──
 function readPPU(vramAddr) {
     if (vramAddr < 0x2000) {
-        return e.chrArr[vramAddr]
+        return chrArr[vramAddr]
     } else if (vramAddr < 0x3F00) {
         // Nametable read (with H/V mirroring)
         if ((e.inesHdr[6] & 1) == 0) {
             // horizontal mirroring
-            return e.vramArr[(vramAddr & 0x3FF) | ((vramAddr & 0x800) >>> 1)]
+            return vramArr[(vramAddr & 0x3FF) | ((vramAddr & 0x800) >>> 1)]
         } else {
             // vertical mirroring
-            return e.vramArr[vramAddr & 0x7FF]
+            return vramArr[vramAddr & 0x7FF]
         }
     } else {
         // Palette RAM
-        if ((vramAddr & 3) == 0) return e.palArr[vramAddr & 0x0F]
-        else                     return e.palArr[vramAddr & 0x1F]
+        if ((vramAddr & 3) == 0) return palArr[vramAddr & 0x0F]
+        else                     return palArr[vramAddr & 0x1F]
     }
 }
 
@@ -1133,7 +1122,6 @@ const sprSchedCount = new Uint8Array(240)       // active sprite slots per scanl
 const sprSchedIdx   = new Uint8Array(240 * 8)  // OAM indices [0..63], up to 8 per scanline
 
 function buildSpriteSchedule() {
-    const oamArr = e.oamArr
     const sprH   = e.ppuUse8x16Sprites ? 16 : 8
     sprSchedCount.fill(0, 0, 240)
     for (let i = 0; i < 64; i++) {
@@ -1166,8 +1154,6 @@ function evalSpritesForScanline(sl) {
         return 0
     }
 
-    const oamArr    = e.oamArr
-    const chrArr    = e.chrArr
     const use8x16   = e.ppuUse8x16Sprites
     const sprPTbase = e.ppuSpritePatternTable ? 0x1000 : 0
     const atr = e.ppuSpriteAtr
@@ -1226,10 +1212,7 @@ function renderScanline(sl) {
     const maskBG8   = e.ppuMask8pxMaskBG
     const maskSp8   = e.ppuMask8pxMaskSprites
     const fineX     = e.ppuScrollFineX
-    const palArr    = e.palArr
     const fbArr     = e.fbArr
-    const chrArr    = e.chrArr
-    const vramArr   = e.vramArr
     // Nametable mirroring mode (constant per ROM, hoisted out of readPPU)
     const hMirror   = (e.inesHdr[6] & 1) == 0  // true = horizontal, false = vertical
     // ── Item 8: frameskip — still compute sprite-0 hit but skip pixel writes ──
@@ -1237,7 +1220,7 @@ function renderScanline(sl) {
     const fbBase    = sl * 256
 
     // Sprite evaluation
-    let _t0 = sys.nanoTime(); const sprSlots = evalSpritesForScanline(sl); prof_ppu_eval += sys.nanoTime() - _t0
+    const sprSlots = evalSpritesForScanline(sl)
     const shL = e.ppuSpriteShiftRegL
     const shH = e.ppuSpriteShiftRegH
     const sAtr = e.ppuSpriteAtr
@@ -1245,7 +1228,6 @@ function renderScanline(sl) {
     const sprZeroThisSl = e.ppuScanlineContainsSprZero
 
     // Fetch 33 BG tiles (33 = 32 visible + 1 extra for fine-X overflow)
-    let _t1 = sys.nanoTime()
     if (renderBG) {
         let va = e.vramAddr
         const highPT = e.ppuBGPatternTable
@@ -1277,11 +1259,9 @@ function renderScanline(sl) {
             else                   va++
         }
     }
-    prof_ppu_bgfetch += sys.nanoTime() - _t1
 
     // Pre-build sprite line: O(sprSlots × 8) ≤ 64 ops, so pixel loop needs no inner scan.
     // Higher-priority (lower index) sprites win; first opaque write per dot wins.
-    let _t2 = sys.nanoTime()
     sprLinePalLo.fill(0, 0, 256)
     if (renderSpr) {
         for (let i = 0; i < sprSlots; i++) {
@@ -1305,10 +1285,8 @@ function renderScanline(sl) {
             }
         }
     }
-    prof_ppu_pixels += sys.nanoTime() - _t2  // counts pre-build as "pixels" work
 
     // Pixel loop — O(256), O(1) sprite lookup per dot
-    let _t3 = sys.nanoTime()
     let sprHitPending = sprZeroThisSl  // false once hit fires (fires at most once per scanline)
     for (let dot = 0; dot < 256; dot++) {
         // BG pixel
@@ -1342,7 +1320,6 @@ function renderScanline(sl) {
 
         if (!skip) fbArr[fbBase + dot] = palArr[finalHi * 4 + finalLo]
     }
-    prof_ppu_pixels += sys.nanoTime() - _t3
 }
 
 // ── Item 3: PPU budget driver (replaces per-dot emulatePPU) ──
@@ -1444,8 +1421,8 @@ function drawPatternTable() {
         for (let row = 0; row < 16; row++) {
             for (let col = 0; col < 16; col++) {
                 for (let y = 0; y < 8; y++) {
-                    let lo = e.chrArr[0 + y + col*16 + row*256 + table*4096]
-                    let hi = e.chrArr[8 + y + col*16 + row*256 + table*4096]
+                    let lo = chrArr[0 + y + col*16 + row*256 + table*4096]
+                    let hi = chrArr[8 + y + col*16 + row*256 + table*4096]
                     for (let x = 0; x < 8; x++) {
                         let px = (((lo >>> (7-x)) & 1)) | (((hi >>> (7-x)) & 1) << 1)
                         let palette = [240, 245, 250, 239]
@@ -1461,18 +1438,18 @@ function drawNameTable() {
     for (let row = 0; row < 30; row++) {
         for (let col = 0; col < 32; col++) {
             let attrOffset = ((col >>> 2) + (row >>> 2) * 8) & 255
-            let attr    = e.vramArr[0x3C0 + attrOffset]
+            let attr    = vramArr[0x3C0 + attrOffset]
             let quadrant = (((col >>> 1) & 1) + ((row >>> 1) & 1) * 2) & 255
             let pair    = (attr >>> (quadrant * 2)) & 3
-            let tileId  = e.vramArr[col + row * 32]
+            let tileId  = vramArr[col + row * 32]
             let ptBase  = e.ppuBGPatternTable ? 0x1000 : 0
 
             for (let y = 0; y < 8; y++) {
-                let lo = e.chrArr[ptBase + tileId * 16 + y]
-                let hi = e.chrArr[ptBase + tileId * 16 + y + 8]
+                let lo = chrArr[ptBase + tileId * 16 + y]
+                let hi = chrArr[ptBase + tileId * 16 + y + 8]
                 for (let x = 0; x < 8; x++) {
                     let px  = (((lo >>> (7-x)) & 1)) | (((hi >>> (7-x)) & 1) << 1)
-                    let col2 = (px == 0) ? e.palArr[0] : e.palArr[px + pair * 4]
+                    let col2 = (px == 0) ? palArr[0] : palArr[px + pair * 4]
                     e.fbArr[(y + row*8)*256 + (x + col*8)] = col2
                 }
             }
@@ -1570,14 +1547,7 @@ while (!appexit && !cpu_halted) {
             let pctPPU    = total > 0 ? ((prof_ppu    * 100 / total + 0.5) | 0) : 0
             let pctRender = total > 0 ? ((prof_render * 100 / total + 0.5) | 0) : 0
             let msPerFrame = total > 0 ? ((total / prof_frames / 1e6 * 10 + 0.5) | 0) / 10 : 0
-            // PPU sub-breakdown (percentages of prof_ppu)
-            let ppuOther = prof_ppu - prof_ppu_eval - prof_ppu_bgfetch - prof_ppu_pixels
-            let pp = prof_ppu > 0
-            let pctEval   = pp ? ((prof_ppu_eval    * 100 / prof_ppu + 0.5) | 0) : 0
-            let pctBG     = pp ? ((prof_ppu_bgfetch * 100 / prof_ppu + 0.5) | 0) : 0
-            let pctPx     = pp ? ((prof_ppu_pixels  * 100 / prof_ppu + 0.5) | 0) : 0
-            let pctOther  = pp ? ((ppuOther          * 100 / prof_ppu + 0.5) | 0) : 0
-            serial.println(`[prof] ${fps} fps | ${msPerFrame}ms/frame | CPU:${pctCPU}% PPU:${pctPPU}%(eval:${pctEval}% bg:${pctBG}% px:${pctPx}% misc:${pctOther}%) render:${pctRender}%`)
+            serial.println(`[prof] ${fps} fps | ${msPerFrame}ms/frame | CPU:${pctCPU}% PPU:${pctPPU}% render:${pctRender}%`)
 
             // ── CPU sub-report ──
             const fi = prof_frames  // rendered-frame count this window
@@ -1586,21 +1556,7 @@ while (!appexit && !cpu_halted) {
             const nmiPerFr= fi > 0 ? ((prof_cpu_nmi * 10 / fi + 0.5) | 0) / 10 : 0
             const cycTotal = prof_cpu_cycles + prof_cpu_skip
             const pctSkip = cycTotal > 0 ? ((prof_cpu_skip * 100 / cycTotal + 0.5) | 0) : 0
-            // read() breakdown
-            const rTot = prof_read_ram + prof_read_ppu + prof_read_apu + prof_read_rom
-            const rp = rTot > 0
-            const pctRdRAM  = rp ? ((prof_read_ram * 100 / rTot + 0.5) | 0) : 0
-            const pctRdPPU  = rp ? ((prof_read_ppu * 100 / rTot + 0.5) | 0) : 0
-            const pctRdAPU  = rp ? ((prof_read_apu * 100 / rTot + 0.5) | 0) : 0
-            const pctRdROM  = rp ? ((prof_read_rom * 100 / rTot + 0.5) | 0) : 0
-            // write() breakdown
-            const wTot = prof_write_ram + prof_write_ppu + prof_write_oam + prof_write_apu
-            const wp = wTot > 0
-            const pctWrRAM  = wp ? ((prof_write_ram * 100 / wTot + 0.5) | 0) : 0
-            const pctWrPPU  = wp ? ((prof_write_ppu * 100 / wTot + 0.5) | 0) : 0
-            const pctWrOAM  = wp ? ((prof_write_oam * 100 / wTot + 0.5) | 0) : 0
-            const pctWrAPU  = wp ? ((prof_write_apu * 100 / wTot + 0.5) | 0) : 0
-            serial.println(`[cpu ] ${iPerFr} i/fr  ${cPerFr} c/fr  NMI:${nmiPerFr}/fr  skip:${pctSkip}% | reads(${rTot > 0 ? ((rTot/fi+0.5)|0) : 0}/fr): RAM:${pctRdRAM}% PPU:${pctRdPPU}% ROM:${pctRdROM}% ctrl:${pctRdAPU}% | writes(${wTot > 0 ? ((wTot/fi+0.5)|0) : 0}/fr): RAM:${pctWrRAM}% PPU:${pctWrPPU}% OAM:${pctWrOAM}% APU:${pctWrAPU}%`)
+            serial.println(`[cpu ] ${iPerFr} i/fr  ${cPerFr} c/fr  NMI:${nmiPerFr}/fr  skip:${pctSkip}%`)
 
             // ── Top-8 hottest opcodes ──
             let hotOps = []
@@ -1617,10 +1573,7 @@ while (!appexit && !cpu_halted) {
 
             // reset all CPU sub-counters
             prof_cpu = 0; prof_ppu = 0; prof_render = 0; prof_frames = 0
-            prof_ppu_eval = 0; prof_ppu_bgfetch = 0; prof_ppu_pixels = 0
             prof_cpu_instrs = 0; prof_cpu_cycles = 0; prof_cpu_nmi = 0; prof_cpu_skip = 0
-            prof_read_ram = 0; prof_read_ppu = 0; prof_read_apu = 0; prof_read_rom = 0
-            prof_write_ram = 0; prof_write_ppu = 0; prof_write_oam = 0; prof_write_apu = 0
             prof_opcodeHits.fill(0)
             prof_wallStart = sys.nanoTime()
         }
