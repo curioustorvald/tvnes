@@ -18,6 +18,16 @@ config.p1l = 47 // LEFT = s
 config.p1r = 34 // RIGHT = f
 config.printTracelog = false
 
+// ── CPU registers + flags (module-level so GraalJS keeps them in machine registers) ──
+let cpu_pc = 0, cpu_sp = 0, cpu_a = 0, cpu_x = 0, cpu_y = 0
+let cpu_fC = false, cpu_fZ = false, cpu_fN = false, cpu_fV = false, cpu_fI = false, cpu_fD = false
+let cpu_halted = false
+let cpu_nmiLevel = false, cpu_doNMI = false, cpu_nmiFired = 0
+let cpu_totalCycles = 0
+// ── Hot PPU/loop flags hoisted out of e (read every CPU instruction or every scanline) ──
+let ppu_vblank = false, ppu_enableNMI = false
+let ppu_cycleBudget = 0, ppu_drawNewFrame = false, ppu_skipRender = false
+
 // CPU / PPU state
 const e = {}
 // ── Item 1: all NES memory as JS typed arrays (no sys.peek/poke in hot paths) ──
@@ -33,24 +43,7 @@ e.inesHdr = new Uint8Array(16)
 // ── Item 2: framebuffer as JS typed array; GPU flush done at frame-end ──
 e.fbArr = new Uint8Array(256 * 240)  // NES framebuffer (palette indices)
 // e.fb usermem scratch removed — fbToGPU now uses sys.pokeBytes directly to GPU
-// 6502 registers
-e.pc = 0
-e.sp = 0
-e.a = 0
-e.x = 0
-e.y = 0
-// 6502 flags
-e.halted  = false
-e.fCarry  = false
-e.fZero   = false
-e.fIntdis = false
-e.fDec    = false
-e.fOvf    = false
-e.fNeg    = false
-// NMI state
-e.nmiLevel = false
-e.doNMI    = false
-e.nmiFired = 0
+// 6502 registers, flags, NMI state → hoisted to module-level cpu_* variables above
 // PPU registers & internal state
 e.writeLatch       = false
 e.transferAddr     = 0
@@ -60,7 +53,7 @@ e.ppuVramInc32Mode = false
 e.ppuReadBuffer    = 0
 e.ppuDot           = 0
 e.ppuScanline      = 0
-e.ppuVblank        = false
+// ppu_vblank → hoisted to module-level above
 e.ppuMask8pxMaskBG      = false
 e.ppuMask8pxMaskSprites = false
 e.ppuMaskRenderBG       = false
@@ -69,7 +62,7 @@ e.ppuNametableSelect  = 0
 e.ppuSpritePatternTable = false
 e.ppuBGPatternTable     = false
 e.ppuUse8x16Sprites     = false
-e.ppuEnableNMI          = false
+// ppu_enableNMI → hoisted to module-level above
 e.ppuStatusOverflow     = false
 e.ppuStatusSprZeroHit   = false
 e.ppuShiftRegPtnL = 0
@@ -92,17 +85,12 @@ e.ppuSpriteAtr  = new Uint8Array(8)
 e.ppuSpritePtn  = new Uint8Array(8)
 e.ppuSpritePosX = new Uint8Array(8)
 e.ppuSpritePosY = new Uint8Array(8)
-// ── Item 3: scanline-based PPU budget ──
-e.ppuCycleBudget = 0
-// ── Item 8: frame skip state ──
-e.skipRender = false
+// ppu_cycleBudget, ppu_drawNewFrame, ppu_skipRender → hoisted to module-level above
 // Controller shift registers
 e.currentButtonStatus = 0
 e.cnt1sr = 0
 e.cnt2sr = 0
-// Emulation timing
-e.drawNewFrame = false
-e.totalCycles  = 0     // cumulative CPU cycles (used by tracelogger)
+// cpu_totalCycles, ppu_drawNewFrame → hoisted to module-level above
 
 ///////////////////////////////////////////////////////////////////////////////
 // ── Item 7: bit-reverse lookup table (for sprite horizontal flip) ──
@@ -183,9 +171,9 @@ const OPCODE_NAMES = [
 // ── Item 5: lift e.* helpers to top-level functions ──
 
 function readPC() {
-    let pc = e.pc
+    let pc = cpu_pc
     let v = pc >= 0x8000 ? e.romArr[pc - 0x8000] : read(pc)
-    e.pc = (pc + 1) & 0xFFFF
+    cpu_pc = (pc + 1) & 0xFFFF
     return v
 }
 
@@ -195,7 +183,7 @@ function readPCs() {
 }
 
 function readPCu16() {
-    let pc = e.pc
+    let pc = cpu_pc
     let lo, hi
     if (pc >= 0x8000) {
         lo = e.romArr[pc - 0x8000]
@@ -204,19 +192,19 @@ function readPCu16() {
         lo = read(pc)
         hi = read(pc + 1)
     }
-    e.pc = (pc + 2) & 0xFFFF
+    cpu_pc = (pc + 2) & 0xFFFF
     return (hi << 8) | lo
 }
 
 function movPC(offset) {
-    e.pc = (e.pc + offset) & 0xFFFF
+    cpu_pc = (cpu_pc + offset) & 0xFFFF
 }
 
-function incPC() { e.pc = (e.pc + 1) & 0xFFFF }
-function decPC() { e.pc = e.pc == 0 ? 65535 : e.pc - 1 }
+function incPC() { cpu_pc = (cpu_pc + 1) & 0xFFFF }
+function decPC() { cpu_pc = cpu_pc == 0 ? 65535 : cpu_pc - 1 }
 
 function pushPC() {
-    let pc = e.pc
+    let pc = cpu_pc
     push((pc >>> 8) & 0xFF)
     push(pc & 0xFF)
 }
@@ -243,10 +231,10 @@ function read(offset) {
         switch (offset) {
             case 0x2002: { // PPUSTATUS
                 let ppuStatus = 0
-                if (e.ppuVblank)            ppuStatus |= 0x80
+                if (ppu_vblank)            ppuStatus |= 0x80
                 if (e.ppuStatusSprZeroHit)  ppuStatus |= 0x40
                 if (e.ppuStatusOverflow)    ppuStatus |= 0x20
-                e.ppuVblank   = false
+                ppu_vblank   = false
                 e.writeLatch  = false
                 return ppuStatus
             }
@@ -305,7 +293,7 @@ function write(offset0, value) {
                 e.ppuSpritePatternTable = (value & 8)  != 0
                 e.ppuBGPatternTable   = (value & 16)  != 0
                 e.ppuUse8x16Sprites   = (value & 32)  != 0
-                e.ppuEnableNMI        = (value & 128) != 0
+                ppu_enableNMI        = (value & 128) != 0
                 // propagate NT bits into _tempVramAddr bits 10–11
                 e._tempVramAddr = (e._tempVramAddr & 0b0111001111111111) | ((value & 3) << 10)
                 break
@@ -410,19 +398,23 @@ function write(offset0, value) {
     // Cartridge space ($4020–$7FFF): SRAM / expansion — ignored for mapper 0
 }
 
+// Stack is always $0100–$01FF (always in CPU RAM) — bypass read()/write() dispatch.
 function push(value) {
-    write(0x100 + e.sp, value)
-    e.sp = (e.sp - 1) & 0xFF
+    e.ramArr[0x100 + cpu_sp] = value
+    cpu_sp = (cpu_sp - 1) & 0xFF
 }
 
 function pull() {
-    e.sp = (e.sp + 1) & 0xFF
-    return read(0x100 + e.sp)
+    cpu_sp = (cpu_sp + 1) & 0xFF
+    return e.ramArr[0x100 + cpu_sp]
 }
 
 function pullu16() {
-    let lo = pull()
-    let hi = pull()
+    let sp = (cpu_sp + 1) & 0xFF
+    let lo = e.ramArr[0x100 + sp]
+    sp = (sp + 1) & 0xFF
+    let hi = e.ramArr[0x100 + sp]
+    cpu_sp = sp
     return (hi << 8) | lo
 }
 
@@ -459,11 +451,11 @@ function reset() {
     sys.free(headeredRom)
 
     // RESET vector
-    e.fIntdis = true
+    cpu_fI = true
     let PCL = read(0xFFFC)
     let PCH = read(0xFFFD)
-    e.pc = (PCH << 8) | PCL
-    e.sp = 0xFD
+    cpu_pc = (PCH << 8) | PCL
+    cpu_sp = 0xFD
 
     // ── Item 11: open trace file and emit RESET line ──
     if (config.printTracelog) {
@@ -499,11 +491,11 @@ let traceLogCnt = 0
 let traceFile = null   // set in reset() when config.printTracelog is true
 function printTracelog(opcode) {
     // Recover opcode address: PC has already been incremented past the opcode byte.
-    let pc = e.pc
-    if (!e.doNMI) {
+    let pc = cpu_pc
+    if (!cpu_doNMI) {
         pc = (pc - 1) & 0xFFFF  // back up to opcode byte address
     }
-    if (e.doNMI) opcode = 0x100  // NMI pseudo-opcode
+    if (cpu_doNMI) opcode = 0x100  // NMI pseudo-opcode
 
     // ── Bytes field (1–3 hex bytes, padded to ≥7 chars) ──
     let bytesStr = ''
@@ -532,17 +524,17 @@ function printTracelog(opcode) {
             case 2: instrStr += '#' + b1.toString(16).padStart(2,'0').toUpperCase(); break
             case 3: instrStr += '<$' + b1.toString(16).padStart(2,'0').toUpperCase(); break
             case 4: instrStr += '<$' + b1.toString(16).padStart(2,'0').toUpperCase() + ', X -> $' +
-                                ((b1 + e.x) & 0xFF).toString(16).padStart(2,'0').toUpperCase(); break
+                                ((b1 + cpu_x) & 0xFF).toString(16).padStart(2,'0').toUpperCase(); break
             case 5: instrStr += '<$' + b1.toString(16).padStart(2,'0').toUpperCase() + ', Y -> $' +
-                                ((b1 + e.y) & 0xFF).toString(16).padStart(2,'0').toUpperCase(); break
+                                ((b1 + cpu_y) & 0xFF).toString(16).padStart(2,'0').toUpperCase(); break
             case 6: instrStr += '$' + b2.toString(16).padStart(2,'0').toUpperCase() +
                                        b1.toString(16).padStart(2,'0').toUpperCase(); break
             case 7: instrStr += '$' + b2.toString(16).padStart(2,'0').toUpperCase() +
                                        b1.toString(16).padStart(2,'0').toUpperCase() +
-                                ', X -> $' + ((abs16 + e.x) & 0xFFFF).toString(16).padStart(4,'0').toUpperCase(); break
+                                ', X -> $' + ((abs16 + cpu_x) & 0xFFFF).toString(16).padStart(4,'0').toUpperCase(); break
             case 8: instrStr += '$' + b2.toString(16).padStart(2,'0').toUpperCase() +
                                        b1.toString(16).padStart(2,'0').toUpperCase() +
-                                ', Y -> $' + ((abs16 + e.y) & 0xFFFF).toString(16).padStart(4,'0').toUpperCase(); break
+                                ', Y -> $' + ((abs16 + cpu_y) & 0xFFFF).toString(16).padStart(4,'0').toUpperCase(); break
             case 9: { // relative — show resolved branch target
                 let sv = b1 > 127 ? b1 - 256 : b1
                 let target = (pc + 2 + sv) & 0xFFFF
@@ -555,7 +547,7 @@ function printTracelog(opcode) {
                             ') -> $' + resolved.toString(16).padStart(4,'0').toUpperCase(); break
             }
             case 11: { // (zp, X)
-                let zpAddr = (b1 + e.x) & 0xFF
+                let zpAddr = (b1 + cpu_x) & 0xFF
                 let resolved = peekRO(zpAddr) | (peekRO((zpAddr + 1) & 0xFF) << 8)
                 instrStr += '($00' + b1.toString(16).padStart(2,'0').toUpperCase() +
                             ', X) -> $' + resolved.toString(16).padStart(4,'0').toUpperCase(); break
@@ -563,7 +555,7 @@ function printTracelog(opcode) {
             case 12: { // (zp), Y
                 let resolved = (peekRO(b1) | (peekRO((b1 + 1) & 0xFF) << 8))
                 instrStr += '($00' + b1.toString(16).padStart(2,'0').toUpperCase() +
-                            '), Y -> $' + ((resolved + e.y) & 0xFFFF).toString(16).padStart(4,'0').toUpperCase(); break
+                            '), Y -> $' + ((resolved + cpu_y) & 0xFFFF).toString(16).padStart(4,'0').toUpperCase(); break
             }
         }
         // Annotate $2007 access
@@ -576,12 +568,12 @@ function printTracelog(opcode) {
     if (instrStr.length < 17) instrStr += '\t'
 
     // ── Flags ──
-    let flags = (e.fNeg    ? 'N' : 'n') + (e.fOvf    ? 'V' : 'v') + '--' +
-                (e.fDec    ? 'D' : 'd') + (e.fIntdis  ? 'I' : 'i') +
-                (e.fZero   ? 'Z' : 'z') + (e.fCarry   ? 'C' : 'c')
+    let flags = (cpu_fN    ? 'N' : 'n') + (cpu_fV    ? 'V' : 'v') + '--' +
+                (cpu_fD    ? 'D' : 'd') + (cpu_fI  ? 'I' : 'i') +
+                (cpu_fZ   ? 'Z' : 'z') + (cpu_fC   ? 'C' : 'c')
 
     // ── PPU cycle formula (matches C# TriCnes logic) ──
-    let sl = e.ppuScanline, dot = e.ppuDot, totalCyc = e.totalCycles
+    let sl = e.ppuScanline, dot = e.ppuDot, totalCyc = cpu_totalCycles
     let ppuCyc
     if (totalCyc < 27395) {
         ppuCyc = sl * 341 + dot
@@ -594,10 +586,10 @@ function printTracelog(opcode) {
     let s = '$' + pc.toString(16).padStart(4,'0').toUpperCase() + '\t' +
             bytesStr + '\t' +
             instrStr + '\t' +
-            'A:' + e.a.toString(16).padStart(2,'0').toUpperCase() + '\t' +
-            'X:' + e.x.toString(16).padStart(2,'0').toUpperCase() + '\t' +
-            'Y:' + e.y.toString(16).padStart(2,'0').toUpperCase() + '\t' +
-            'SP:' + e.sp.toString(16).padStart(2,'0').toUpperCase() + '\t' +
+            'A:' + cpu_a.toString(16).padStart(2,'0').toUpperCase() + '\t' +
+            'X:' + cpu_x.toString(16).padStart(2,'0').toUpperCase() + '\t' +
+            'Y:' + cpu_y.toString(16).padStart(2,'0').toUpperCase() + '\t' +
+            'SP:' + cpu_sp.toString(16).padStart(2,'0').toUpperCase() + '\t' +
             flags + '\t' +
             'Cycle: ' + totalCyc + '\t' +
             'PPU_cycle: ' + ppuCyc + ' ' + ppuPos + '\t' +
@@ -610,15 +602,25 @@ function printTracelog(opcode) {
 ///////////////////////////////////////////////////////////////////////////////
 
 function run() {
-    while (!e.halted) {
+    // Keep ppuBudget as a local to avoid repeated property reads/writes.
+    // stepPPU is only called when the budget reaches a scanline boundary (341 dots),
+    // reducing calls from ~10k/frame to ~262/frame (one per scanline).
+    let ppuBudget = ppu_cycleBudget
+    while (!cpu_halted) {
         emulateCPU()
-        stepPPU()
-        if (e.drawNewFrame) {
-            e.drawNewFrame = false
-            break
+        ppuBudget += cycles * 3
+        if (ppuBudget >= 341) {
+            ppu_cycleBudget = ppuBudget
+            stepPPU()
+            ppuBudget = ppu_cycleBudget  // stepPPU zeroes it after consuming
+            if (ppu_drawNewFrame) {
+                ppu_drawNewFrame = false
+                break
+            }
         }
     }
-    if (e.halted) serial.println('CPU Halted')
+    ppu_cycleBudget = ppuBudget
+    if (cpu_halted) serial.println('CPU Halted')
 }
 
 // Module-level scratch (shared across emulateCPU and address-mode helpers)
@@ -628,20 +630,20 @@ let pageCrossed = false
 
 function doBranchingOnPredicate(p) {
     let sv = readPCs()
-    let oldPCh = e.pc >>> 8
+    let oldPCh = cpu_pc >>> 8
     if (p) {
         movPC(sv)
-        let newPCh = e.pc >>> 8
+        let newPCh = cpu_pc >>> 8
         cycles = 3 + ((oldPCh != newPCh) ? 1 : 0)
     } else {
         cycles = 2
     }
 }
 
+// Zero-page is always CPU RAM — bypass read() dispatch.
 function readZpU16(addr) {
-    let lo = read(addr & 0xFF)
-    let hi = read((addr + 1) & 0xFF)
-    return (hi << 8) | lo
+    let a = addr & 0xFF
+    return e.ramArr[a] | (e.ramArr[(a + 1) & 0xFF] << 8)
 }
 
 function readU16Wrap(addr) {
@@ -651,101 +653,101 @@ function readU16Wrap(addr) {
 }
 
 // ── Item 5: addressing modes use top-level readPC/readPCu16 ──
-function addrZpX()  { return (readPC() + e.x) & 0xFF }
-function addrZpY()  { return (readPC() + e.y) & 0xFF }
+function addrZpX()  { return (readPC() + cpu_x) & 0xFF }
+function addrZpY()  { return (readPC() + cpu_y) & 0xFF }
 function addrAbsX() {
     let base = readPCu16()
-    let addr = (base + e.x) & 0xFFFF
+    let addr = (base + cpu_x) & 0xFFFF
     pageCrossed = (base & 0xFF00) != (addr & 0xFF00)
     return addr
 }
 function addrAbsY() {
     let base = readPCu16()
-    let addr = (base + e.y) & 0xFFFF
+    let addr = (base + cpu_y) & 0xFFFF
     pageCrossed = (base & 0xFF00) != (addr & 0xFF00)
     return addr
 }
-function addrIndX() { return readZpU16((readPC() + e.x) & 0xFF) }
+function addrIndX() { return readZpU16((readPC() + cpu_x) & 0xFF) }
 function addrIndY() {
     let base = readZpU16(readPC())
-    let addr = (base + e.y) & 0xFFFF
+    let addr = (base + cpu_y) & 0xFFFF
     pageCrossed = (base & 0xFF00) != (addr & 0xFF00)
     return addr
 }
 
 // ALU helpers (use e.* directly for brevity; hot path is the typed-array reads above)
 function doADC(val) {
-    let sum = e.a + val + (e.fCarry ? 1 : 0)
-    e.fOvf   = ((~(e.a ^ val)) & (e.a ^ sum) & 0x80) != 0
-    e.fCarry = sum > 255
-    e.a      = sum & 0xFF
-    e.fZero  = e.a == 0; e.fNeg = e.a > 127  // ── Item 6: inline setResultFlags ──
+    let sum = cpu_a + val + (cpu_fC ? 1 : 0)
+    cpu_fV   = ((~(cpu_a ^ val)) & (cpu_a ^ sum) & 0x80) != 0
+    cpu_fC = sum > 255
+    cpu_a      = sum & 0xFF
+    cpu_fZ  = cpu_a == 0; cpu_fN = cpu_a > 127  // ── Item 6: inline setResultFlags ──
 }
 function doSBC(val) { doADC(val ^ 0xFF) }
 function doCMP(reg, val) {
     let diff   = reg - val
-    e.fCarry = reg >= val
-    e.fZero  = (diff & 0xFF) == 0
-    e.fNeg   = (diff & 0x80) != 0
+    cpu_fC = reg >= val
+    cpu_fZ  = (diff & 0xFF) == 0
+    cpu_fN   = (diff & 0x80) != 0
 }
 function doASL(val) {
-    e.fCarry = (val & 0x80) != 0
+    cpu_fC = (val & 0x80) != 0
     let r = (val << 1) & 0xFF
-    e.fZero = r == 0; e.fNeg = r > 127
+    cpu_fZ = r == 0; cpu_fN = r > 127
     return r
 }
 function doLSR(val) {
-    e.fCarry = (val & 1) != 0
+    cpu_fC = (val & 1) != 0
     let r = val >>> 1
-    e.fZero = r == 0; e.fNeg = r > 127
+    cpu_fZ = r == 0; cpu_fN = r > 127
     return r
 }
 function doROL(val) {
-    let oldC = e.fCarry ? 1 : 0
-    e.fCarry = (val & 0x80) != 0
+    let oldC = cpu_fC ? 1 : 0
+    cpu_fC = (val & 0x80) != 0
     let r = ((val << 1) | oldC) & 0xFF
-    e.fZero = r == 0; e.fNeg = r > 127
+    cpu_fZ = r == 0; cpu_fN = r > 127
     return r
 }
 function doROR(val) {
-    let oldC = e.fCarry ? 128 : 0
-    e.fCarry = (val & 1) != 0
+    let oldC = cpu_fC ? 128 : 0
+    cpu_fC = (val & 1) != 0
     let r = (val >>> 1) | oldC
-    e.fZero = r == 0; e.fNeg = r > 127
+    cpu_fZ = r == 0; cpu_fN = r > 127
     return r
 }
 function packFlags(bFlag) {
-    return (e.fNeg    ? 0x80 : 0) | (e.fOvf    ? 0x40 : 0) | 0x20 |
-           (bFlag     ? 0x10 : 0) | (e.fDec    ? 0x08 : 0) |
-           (e.fIntdis ? 0x04 : 0) | (e.fZero   ? 0x02 : 0) | (e.fCarry ? 0x01 : 0)
+    return (cpu_fN    ? 0x80 : 0) | (cpu_fV    ? 0x40 : 0) | 0x20 |
+           (bFlag     ? 0x10 : 0) | (cpu_fD    ? 0x08 : 0) |
+           (cpu_fI ? 0x04 : 0) | (cpu_fZ   ? 0x02 : 0) | (cpu_fC ? 0x01 : 0)
 }
 function unpackFlags(val) {
-    e.fNeg    = (val & 0x80) != 0
-    e.fOvf    = (val & 0x40) != 0
-    e.fDec    = (val & 0x08) != 0
-    e.fIntdis = (val & 0x04) != 0
-    e.fZero   = (val & 0x02) != 0
-    e.fCarry  = (val & 0x01) != 0
+    cpu_fN    = (val & 0x80) != 0
+    cpu_fV    = (val & 0x40) != 0
+    cpu_fD    = (val & 0x08) != 0
+    cpu_fI = (val & 0x04) != 0
+    cpu_fZ   = (val & 0x02) != 0
+    cpu_fC  = (val & 0x01) != 0
 }
 
 ///////////////////////////////////////////////////////////////////////////////
 // ── Items 4, 6, 10: emulateCPU with fast opcode fetch, inlined flags ──
 function emulateCPU() {
     // NMI edge detection
-    let prevNMIlevel = e.nmiLevel
-    e.nmiLevel = e.ppuEnableNMI && e.ppuVblank
-    if (!prevNMIlevel && e.nmiLevel) e.doNMI = true
+    let prevNMIlevel = cpu_nmiLevel
+    cpu_nmiLevel = ppu_enableNMI && ppu_vblank
+    if (!prevNMIlevel && cpu_nmiLevel) cpu_doNMI = true
 
     let opcode
-    if (!e.doNMI) {
+    if (!cpu_doNMI) {
         // ── Item 10: fast opcode fetch from ROM without going through read() ──
-        let pc = e.pc
+        let pc = cpu_pc
         if (pc >= 0x8000) {
             opcode = e.romArr[pc - 0x8000]
-            e.pc = (pc + 1) & 0xFFFF
+            cpu_pc = (pc + 1) & 0xFFFF
         } else {
             opcode = read(pc)
-            e.pc = (pc + 1) & 0xFFFF
+            cpu_pc = (pc + 1) & 0xFFFF
         }
     } else {
         opcode = 0x00
@@ -757,93 +759,93 @@ function emulateCPU() {
 
         // BRK / NMI / IRQ handler
         case 0x00:
-            if (!e.doNMI) incPC()  // skip padding byte
+            if (!cpu_doNMI) incPC()  // skip padding byte
             pushPC()
             push(packFlags(true))
-            e.pc    = e.doNMI ? (read(0xFFFA) | (read(0xFFFB) << 8)) : (read(0xFFFE) | (read(0xFFFF) << 8))
-            e.doNMI = false
-            e.nmiFired++
+            cpu_pc    = cpu_doNMI ? (read(0xFFFA) | (read(0xFFFB) << 8)) : (read(0xFFFE) | (read(0xFFFF) << 8))
+            cpu_doNMI = false
+            cpu_nmiFired++
             cycles  = 7
             break
 
         // ORA
-        case 0x01: e.a = e.a | read(addrIndX()); e.fZero = e.a==0; e.fNeg = e.a>127; cycles = 6; break
-        case 0x05: e.a = e.a | read(readPC());    e.fZero = e.a==0; e.fNeg = e.a>127; cycles = 3; break
-        case 0x09: e.a = e.a | readPC();           e.fZero = e.a==0; e.fNeg = e.a>127; cycles = 2; break
-        case 0x0D: e.a = e.a | read(readPCu16());  e.fZero = e.a==0; e.fNeg = e.a>127; cycles = 4; break
-        case 0x11: e.a = e.a | read(addrIndY());   e.fZero = e.a==0; e.fNeg = e.a>127; cycles = 5 + pageCrossed; break
-        case 0x15: e.a = e.a | read(addrZpX());    e.fZero = e.a==0; e.fNeg = e.a>127; cycles = 4; break
-        case 0x19: e.a = e.a | read(addrAbsY());   e.fZero = e.a==0; e.fNeg = e.a>127; cycles = 4 + pageCrossed; break
-        case 0x1D: e.a = e.a | read(addrAbsX());   e.fZero = e.a==0; e.fNeg = e.a>127; cycles = 4 + pageCrossed; break
+        case 0x01: cpu_a = cpu_a | read(addrIndX()); cpu_fZ = cpu_a==0; cpu_fN = cpu_a>127; cycles = 6; break
+        case 0x05: cpu_a = cpu_a | read(readPC());    cpu_fZ = cpu_a==0; cpu_fN = cpu_a>127; cycles = 3; break
+        case 0x09: cpu_a = cpu_a | readPC();           cpu_fZ = cpu_a==0; cpu_fN = cpu_a>127; cycles = 2; break
+        case 0x0D: cpu_a = cpu_a | read(readPCu16());  cpu_fZ = cpu_a==0; cpu_fN = cpu_a>127; cycles = 4; break
+        case 0x11: cpu_a = cpu_a | read(addrIndY());   cpu_fZ = cpu_a==0; cpu_fN = cpu_a>127; cycles = 5 + pageCrossed; break
+        case 0x15: cpu_a = cpu_a | read(addrZpX());    cpu_fZ = cpu_a==0; cpu_fN = cpu_a>127; cycles = 4; break
+        case 0x19: cpu_a = cpu_a | read(addrAbsY());   cpu_fZ = cpu_a==0; cpu_fN = cpu_a>127; cycles = 4 + pageCrossed; break
+        case 0x1D: cpu_a = cpu_a | read(addrAbsX());   cpu_fZ = cpu_a==0; cpu_fN = cpu_a>127; cycles = 4 + pageCrossed; break
 
         // ASL
-        case 0x0A: e.a = doASL(e.a); cycles = 2; break
+        case 0x0A: cpu_a = doASL(cpu_a); cycles = 2; break
         case 0x06: temp = readPC();    write(temp, doASL(read(temp))); cycles = 5; break
         case 0x16: temp = addrZpX();   write(temp, doASL(read(temp))); cycles = 6; break
         case 0x0E: temp = readPCu16(); write(temp, doASL(read(temp))); cycles = 6; break
         case 0x1E: temp = addrAbsX();  write(temp, doASL(read(temp))); cycles = 7; break
 
         case 0x08: push(packFlags(true)); cycles = 3; break  // PHP
-        case 0x10: doBranchingOnPredicate(!e.fNeg);  break  // BPL
-        case 0x18: e.fCarry = false; cycles = 2; break       // CLC
+        case 0x10: doBranchingOnPredicate(!cpu_fN);  break  // BPL
+        case 0x18: cpu_fC = false; cycles = 2; break       // CLC
 
         // JSR
-        case 0x20: temp = readPCu16(); decPC(); pushPC(); e.pc = temp; cycles = 6; break
+        case 0x20: temp = readPCu16(); decPC(); pushPC(); cpu_pc = temp; cycles = 6; break
 
         // AND
-        case 0x21: e.a = e.a & read(addrIndX()); e.fZero = e.a==0; e.fNeg = e.a>127; cycles = 6; break
-        case 0x25: e.a = e.a & read(readPC());    e.fZero = e.a==0; e.fNeg = e.a>127; cycles = 3; break
-        case 0x29: e.a = e.a & readPC();           e.fZero = e.a==0; e.fNeg = e.a>127; cycles = 2; break
-        case 0x2D: e.a = e.a & read(readPCu16());  e.fZero = e.a==0; e.fNeg = e.a>127; cycles = 4; break
-        case 0x31: e.a = e.a & read(addrIndY());   e.fZero = e.a==0; e.fNeg = e.a>127; cycles = 5 + pageCrossed; break
-        case 0x35: e.a = e.a & read(addrZpX());    e.fZero = e.a==0; e.fNeg = e.a>127; cycles = 4; break
-        case 0x39: e.a = e.a & read(addrAbsY());   e.fZero = e.a==0; e.fNeg = e.a>127; cycles = 4 + pageCrossed; break
-        case 0x3D: e.a = e.a & read(addrAbsX());   e.fZero = e.a==0; e.fNeg = e.a>127; cycles = 4 + pageCrossed; break
+        case 0x21: cpu_a = cpu_a & read(addrIndX()); cpu_fZ = cpu_a==0; cpu_fN = cpu_a>127; cycles = 6; break
+        case 0x25: cpu_a = cpu_a & read(readPC());    cpu_fZ = cpu_a==0; cpu_fN = cpu_a>127; cycles = 3; break
+        case 0x29: cpu_a = cpu_a & readPC();           cpu_fZ = cpu_a==0; cpu_fN = cpu_a>127; cycles = 2; break
+        case 0x2D: cpu_a = cpu_a & read(readPCu16());  cpu_fZ = cpu_a==0; cpu_fN = cpu_a>127; cycles = 4; break
+        case 0x31: cpu_a = cpu_a & read(addrIndY());   cpu_fZ = cpu_a==0; cpu_fN = cpu_a>127; cycles = 5 + pageCrossed; break
+        case 0x35: cpu_a = cpu_a & read(addrZpX());    cpu_fZ = cpu_a==0; cpu_fN = cpu_a>127; cycles = 4; break
+        case 0x39: cpu_a = cpu_a & read(addrAbsY());   cpu_fZ = cpu_a==0; cpu_fN = cpu_a>127; cycles = 4 + pageCrossed; break
+        case 0x3D: cpu_a = cpu_a & read(addrAbsX());   cpu_fZ = cpu_a==0; cpu_fN = cpu_a>127; cycles = 4 + pageCrossed; break
 
         // BIT
-        case 0x24: temp = read(readPC());    e.fZero = (e.a & temp)==0; e.fOvf = (temp&0x40)!=0; e.fNeg = (temp&0x80)!=0; cycles = 3; break
-        case 0x2C: temp = read(readPCu16()); e.fZero = (e.a & temp)==0; e.fOvf = (temp&0x40)!=0; e.fNeg = (temp&0x80)!=0; cycles = 4; break
+        case 0x24: temp = read(readPC());    cpu_fZ = (cpu_a & temp)==0; cpu_fV = (temp&0x40)!=0; cpu_fN = (temp&0x80)!=0; cycles = 3; break
+        case 0x2C: temp = read(readPCu16()); cpu_fZ = (cpu_a & temp)==0; cpu_fV = (temp&0x40)!=0; cpu_fN = (temp&0x80)!=0; cycles = 4; break
 
         // ROL
-        case 0x2A: e.a = doROL(e.a); cycles = 2; break
+        case 0x2A: cpu_a = doROL(cpu_a); cycles = 2; break
         case 0x26: temp = readPC();    write(temp, doROL(read(temp))); cycles = 5; break
         case 0x36: temp = addrZpX();   write(temp, doROL(read(temp))); cycles = 6; break
         case 0x2E: temp = readPCu16(); write(temp, doROL(read(temp))); cycles = 6; break
         case 0x3E: temp = addrAbsX();  write(temp, doROL(read(temp))); cycles = 7; break
 
         case 0x28: unpackFlags(pull()); cycles = 4; break  // PLP
-        case 0x30: doBranchingOnPredicate(e.fNeg);  break  // BMI
-        case 0x38: e.fCarry = true;  cycles = 2; break      // SEC
+        case 0x30: doBranchingOnPredicate(cpu_fN);  break  // BMI
+        case 0x38: cpu_fC = true;  cycles = 2; break      // SEC
 
         // RTI
-        case 0x40: unpackFlags(pull()); e.pc = pullu16(); cycles = 6; break
+        case 0x40: unpackFlags(pull()); cpu_pc = pullu16(); cycles = 6; break
 
         // EOR
-        case 0x41: e.a = e.a ^ read(addrIndX()); e.fZero = e.a==0; e.fNeg = e.a>127; cycles = 6; break
-        case 0x45: e.a = e.a ^ read(readPC());    e.fZero = e.a==0; e.fNeg = e.a>127; cycles = 3; break
-        case 0x49: e.a = e.a ^ readPC();           e.fZero = e.a==0; e.fNeg = e.a>127; cycles = 2; break
-        case 0x4D: e.a = e.a ^ read(readPCu16());  e.fZero = e.a==0; e.fNeg = e.a>127; cycles = 4; break
-        case 0x51: e.a = e.a ^ read(addrIndY());   e.fZero = e.a==0; e.fNeg = e.a>127; cycles = 5 + pageCrossed; break
-        case 0x55: e.a = e.a ^ read(addrZpX());    e.fZero = e.a==0; e.fNeg = e.a>127; cycles = 4; break
-        case 0x59: e.a = e.a ^ read(addrAbsY());   e.fZero = e.a==0; e.fNeg = e.a>127; cycles = 4 + pageCrossed; break
-        case 0x5D: e.a = e.a ^ read(addrAbsX());   e.fZero = e.a==0; e.fNeg = e.a>127; cycles = 4 + pageCrossed; break
+        case 0x41: cpu_a = cpu_a ^ read(addrIndX()); cpu_fZ = cpu_a==0; cpu_fN = cpu_a>127; cycles = 6; break
+        case 0x45: cpu_a = cpu_a ^ read(readPC());    cpu_fZ = cpu_a==0; cpu_fN = cpu_a>127; cycles = 3; break
+        case 0x49: cpu_a = cpu_a ^ readPC();           cpu_fZ = cpu_a==0; cpu_fN = cpu_a>127; cycles = 2; break
+        case 0x4D: cpu_a = cpu_a ^ read(readPCu16());  cpu_fZ = cpu_a==0; cpu_fN = cpu_a>127; cycles = 4; break
+        case 0x51: cpu_a = cpu_a ^ read(addrIndY());   cpu_fZ = cpu_a==0; cpu_fN = cpu_a>127; cycles = 5 + pageCrossed; break
+        case 0x55: cpu_a = cpu_a ^ read(addrZpX());    cpu_fZ = cpu_a==0; cpu_fN = cpu_a>127; cycles = 4; break
+        case 0x59: cpu_a = cpu_a ^ read(addrAbsY());   cpu_fZ = cpu_a==0; cpu_fN = cpu_a>127; cycles = 4 + pageCrossed; break
+        case 0x5D: cpu_a = cpu_a ^ read(addrAbsX());   cpu_fZ = cpu_a==0; cpu_fN = cpu_a>127; cycles = 4 + pageCrossed; break
 
         // LSR
-        case 0x4A: e.a = doLSR(e.a); cycles = 2; break
+        case 0x4A: cpu_a = doLSR(cpu_a); cycles = 2; break
         case 0x46: temp = readPC();    write(temp, doLSR(read(temp))); cycles = 5; break
         case 0x56: temp = addrZpX();   write(temp, doLSR(read(temp))); cycles = 6; break
         case 0x4E: temp = readPCu16(); write(temp, doLSR(read(temp))); cycles = 6; break
         case 0x5E: temp = addrAbsX();  write(temp, doLSR(read(temp))); cycles = 7; break
 
-        case 0x48: push(e.a); cycles = 3; break             // PHA
-        case 0x4C: e.pc = readPCu16(); cycles = 3; break    // JMP abs
-        case 0x6C: e.pc = readU16Wrap(readPCu16()); cycles = 5; break  // JMP indirect
+        case 0x48: push(cpu_a); cycles = 3; break             // PHA
+        case 0x4C: cpu_pc = readPCu16(); cycles = 3; break    // JMP abs
+        case 0x6C: cpu_pc = readU16Wrap(readPCu16()); cycles = 5; break  // JMP indirect
 
-        case 0x50: doBranchingOnPredicate(!e.fOvf); break  // BVC
-        case 0x58: e.fIntdis = false; cycles = 2;  break  // CLI
+        case 0x50: doBranchingOnPredicate(!cpu_fV); break  // BVC
+        case 0x58: cpu_fI = false; cycles = 2;  break  // CLI
 
         // RTS
-        case 0x60: e.pc = pullu16() + 1; cycles = 6; break
+        case 0x60: cpu_pc = pullu16() + 1; cycles = 6; break
 
         // ADC
         case 0x61: doADC(read(addrIndX())); cycles = 6; break
@@ -856,109 +858,109 @@ function emulateCPU() {
         case 0x7D: doADC(read(addrAbsX()));   cycles = 4 + pageCrossed; break
 
         // ROR
-        case 0x6A: e.a = doROR(e.a); cycles = 2; break
+        case 0x6A: cpu_a = doROR(cpu_a); cycles = 2; break
         case 0x66: temp = readPC();    write(temp, doROR(read(temp))); cycles = 5; break
         case 0x76: temp = addrZpX();   write(temp, doROR(read(temp))); cycles = 6; break
         case 0x6E: temp = readPCu16(); write(temp, doROR(read(temp))); cycles = 6; break
         case 0x7E: temp = addrAbsX();  write(temp, doROR(read(temp))); cycles = 7; break
 
-        case 0x68: e.a = pull(); e.fZero = e.a==0; e.fNeg = e.a>127; cycles = 4; break  // PLA
-        case 0x70: doBranchingOnPredicate(e.fOvf); break  // BVS
-        case 0x78: e.fIntdis = true; cycles = 2; break    // SEI
+        case 0x68: cpu_a = pull(); cpu_fZ = cpu_a==0; cpu_fN = cpu_a>127; cycles = 4; break  // PLA
+        case 0x70: doBranchingOnPredicate(cpu_fV); break  // BVS
+        case 0x78: cpu_fI = true; cycles = 2; break    // SEI
 
         // STA
-        case 0x81: write(addrIndX(), e.a); cycles = 6; break
-        case 0x85: write(readPC(),   e.a); cycles = 3; break
-        case 0x8D: write(readPCu16(), e.a); cycles = 4; break
-        case 0x91: write(addrIndY(), e.a); cycles = 6; break
-        case 0x95: write(addrZpX(),  e.a); cycles = 4; break
-        case 0x99: write(addrAbsY(), e.a); cycles = 5; break
-        case 0x9D: write(addrAbsX(), e.a); cycles = 5; break
+        case 0x81: write(addrIndX(), cpu_a); cycles = 6; break
+        case 0x85: write(readPC(),   cpu_a); cycles = 3; break
+        case 0x8D: write(readPCu16(), cpu_a); cycles = 4; break
+        case 0x91: write(addrIndY(), cpu_a); cycles = 6; break
+        case 0x95: write(addrZpX(),  cpu_a); cycles = 4; break
+        case 0x99: write(addrAbsY(), cpu_a); cycles = 5; break
+        case 0x9D: write(addrAbsX(), cpu_a); cycles = 5; break
 
         // STY
-        case 0x84: write(readPC(),    e.y); cycles = 3; break
-        case 0x8C: write(readPCu16(), e.y); cycles = 4; break
-        case 0x94: write(addrZpX(),   e.y); cycles = 4; break
+        case 0x84: write(readPC(),    cpu_y); cycles = 3; break
+        case 0x8C: write(readPCu16(), cpu_y); cycles = 4; break
+        case 0x94: write(addrZpX(),   cpu_y); cycles = 4; break
 
         // STX
-        case 0x86: write(readPC(),    e.x); cycles = 3; break
-        case 0x8E: write(readPCu16(), e.x); cycles = 4; break
-        case 0x96: write(addrZpY(),   e.x); cycles = 4; break
+        case 0x86: write(readPC(),    cpu_x); cycles = 3; break
+        case 0x8E: write(readPCu16(), cpu_x); cycles = 4; break
+        case 0x96: write(addrZpY(),   cpu_x); cycles = 4; break
 
-        case 0x88: e.y = (e.y-1)&0xFF; e.fZero = e.y==0; e.fNeg = e.y>127; cycles = 2; break  // DEY
-        case 0x8A: e.a = e.x;          e.fZero = e.a==0; e.fNeg = e.a>127; cycles = 2; break  // TXA
-        case 0x90: doBranchingOnPredicate(!e.fCarry); break  // BCC
-        case 0x98: e.a = e.y;          e.fZero = e.a==0; e.fNeg = e.a>127; cycles = 2; break  // TYA
-        case 0x9A: e.sp = e.x; cycles = 2; break  // TXS
+        case 0x88: cpu_y = (cpu_y-1)&0xFF; cpu_fZ = cpu_y==0; cpu_fN = cpu_y>127; cycles = 2; break  // DEY
+        case 0x8A: cpu_a = cpu_x;          cpu_fZ = cpu_a==0; cpu_fN = cpu_a>127; cycles = 2; break  // TXA
+        case 0x90: doBranchingOnPredicate(!cpu_fC); break  // BCC
+        case 0x98: cpu_a = cpu_y;          cpu_fZ = cpu_a==0; cpu_fN = cpu_a>127; cycles = 2; break  // TYA
+        case 0x9A: cpu_sp = cpu_x; cycles = 2; break  // TXS
 
         // LDY
-        case 0xA0: e.y = readPC();           e.fZero = e.y==0; e.fNeg = e.y>127; cycles = 2; break
-        case 0xA4: e.y = read(readPC());     e.fZero = e.y==0; e.fNeg = e.y>127; cycles = 3; break
-        case 0xAC: e.y = read(readPCu16());  e.fZero = e.y==0; e.fNeg = e.y>127; cycles = 4; break
-        case 0xB4: e.y = read(addrZpX());    e.fZero = e.y==0; e.fNeg = e.y>127; cycles = 4; break
-        case 0xBC: e.y = read(addrAbsX());   e.fZero = e.y==0; e.fNeg = e.y>127; cycles = 4 + pageCrossed; break
+        case 0xA0: cpu_y = readPC();           cpu_fZ = cpu_y==0; cpu_fN = cpu_y>127; cycles = 2; break
+        case 0xA4: cpu_y = read(readPC());     cpu_fZ = cpu_y==0; cpu_fN = cpu_y>127; cycles = 3; break
+        case 0xAC: cpu_y = read(readPCu16());  cpu_fZ = cpu_y==0; cpu_fN = cpu_y>127; cycles = 4; break
+        case 0xB4: cpu_y = read(addrZpX());    cpu_fZ = cpu_y==0; cpu_fN = cpu_y>127; cycles = 4; break
+        case 0xBC: cpu_y = read(addrAbsX());   cpu_fZ = cpu_y==0; cpu_fN = cpu_y>127; cycles = 4 + pageCrossed; break
 
         // LDA
-        case 0xA1: e.a = read(addrIndX()); e.fZero = e.a==0; e.fNeg = e.a>127; cycles = 6; break
-        case 0xA5: e.a = read(readPC());    e.fZero = e.a==0; e.fNeg = e.a>127; cycles = 3; break
-        case 0xA9: e.a = readPC();           e.fZero = e.a==0; e.fNeg = e.a>127; cycles = 2; break
-        case 0xAD: e.a = read(readPCu16());  e.fZero = e.a==0; e.fNeg = e.a>127; cycles = 4; break
-        case 0xB1: e.a = read(addrIndY());   e.fZero = e.a==0; e.fNeg = e.a>127; cycles = 5 + pageCrossed; break
-        case 0xB5: e.a = read(addrZpX());    e.fZero = e.a==0; e.fNeg = e.a>127; cycles = 4; break
-        case 0xB9: e.a = read(addrAbsY());   e.fZero = e.a==0; e.fNeg = e.a>127; cycles = 4 + pageCrossed; break
-        case 0xBD: e.a = read(addrAbsX());   e.fZero = e.a==0; e.fNeg = e.a>127; cycles = 4 + pageCrossed; break
+        case 0xA1: cpu_a = read(addrIndX()); cpu_fZ = cpu_a==0; cpu_fN = cpu_a>127; cycles = 6; break
+        case 0xA5: cpu_a = read(readPC());    cpu_fZ = cpu_a==0; cpu_fN = cpu_a>127; cycles = 3; break
+        case 0xA9: cpu_a = readPC();           cpu_fZ = cpu_a==0; cpu_fN = cpu_a>127; cycles = 2; break
+        case 0xAD: cpu_a = read(readPCu16());  cpu_fZ = cpu_a==0; cpu_fN = cpu_a>127; cycles = 4; break
+        case 0xB1: cpu_a = read(addrIndY());   cpu_fZ = cpu_a==0; cpu_fN = cpu_a>127; cycles = 5 + pageCrossed; break
+        case 0xB5: cpu_a = read(addrZpX());    cpu_fZ = cpu_a==0; cpu_fN = cpu_a>127; cycles = 4; break
+        case 0xB9: cpu_a = read(addrAbsY());   cpu_fZ = cpu_a==0; cpu_fN = cpu_a>127; cycles = 4 + pageCrossed; break
+        case 0xBD: cpu_a = read(addrAbsX());   cpu_fZ = cpu_a==0; cpu_fN = cpu_a>127; cycles = 4 + pageCrossed; break
 
         // LDX
-        case 0xA2: e.x = readPC();           e.fZero = e.x==0; e.fNeg = e.x>127; cycles = 2; break
-        case 0xA6: e.x = read(readPC());     e.fZero = e.x==0; e.fNeg = e.x>127; cycles = 3; break
-        case 0xAE: e.x = read(readPCu16());  e.fZero = e.x==0; e.fNeg = e.x>127; cycles = 4; break
-        case 0xB6: e.x = read(addrZpY());    e.fZero = e.x==0; e.fNeg = e.x>127; cycles = 4; break
-        case 0xBE: e.x = read(addrAbsY());   e.fZero = e.x==0; e.fNeg = e.x>127; cycles = 4 + pageCrossed; break
+        case 0xA2: cpu_x = readPC();           cpu_fZ = cpu_x==0; cpu_fN = cpu_x>127; cycles = 2; break
+        case 0xA6: cpu_x = read(readPC());     cpu_fZ = cpu_x==0; cpu_fN = cpu_x>127; cycles = 3; break
+        case 0xAE: cpu_x = read(readPCu16());  cpu_fZ = cpu_x==0; cpu_fN = cpu_x>127; cycles = 4; break
+        case 0xB6: cpu_x = read(addrZpY());    cpu_fZ = cpu_x==0; cpu_fN = cpu_x>127; cycles = 4; break
+        case 0xBE: cpu_x = read(addrAbsY());   cpu_fZ = cpu_x==0; cpu_fN = cpu_x>127; cycles = 4 + pageCrossed; break
 
-        case 0xA8: e.y = e.a; e.fZero = e.y==0; e.fNeg = e.y>127; cycles = 2; break  // TAY
-        case 0xAA: e.x = e.a; e.fZero = e.x==0; e.fNeg = e.x>127; cycles = 2; break  // TAX
-        case 0xB0: doBranchingOnPredicate(e.fCarry); break  // BCS
-        case 0xB8: e.fOvf = false; cycles = 2; break  // CLV
-        case 0xBA: e.x = e.sp; e.fZero = e.x==0; e.fNeg = e.x>127; cycles = 2; break  // TSX
+        case 0xA8: cpu_y = cpu_a; cpu_fZ = cpu_y==0; cpu_fN = cpu_y>127; cycles = 2; break  // TAY
+        case 0xAA: cpu_x = cpu_a; cpu_fZ = cpu_x==0; cpu_fN = cpu_x>127; cycles = 2; break  // TAX
+        case 0xB0: doBranchingOnPredicate(cpu_fC); break  // BCS
+        case 0xB8: cpu_fV = false; cycles = 2; break  // CLV
+        case 0xBA: cpu_x = cpu_sp; cpu_fZ = cpu_x==0; cpu_fN = cpu_x>127; cycles = 2; break  // TSX
 
         // CPY
-        case 0xC0: doCMP(e.y, readPC());           cycles = 2; break
-        case 0xC4: doCMP(e.y, read(readPC()));     cycles = 3; break
-        case 0xCC: doCMP(e.y, read(readPCu16()));  cycles = 4; break
+        case 0xC0: doCMP(cpu_y, readPC());           cycles = 2; break
+        case 0xC4: doCMP(cpu_y, read(readPC()));     cycles = 3; break
+        case 0xCC: doCMP(cpu_y, read(readPCu16()));  cycles = 4; break
 
         // CMP
-        case 0xC1: doCMP(e.a, read(addrIndX())); cycles = 6; break
-        case 0xC5: doCMP(e.a, read(readPC()));    cycles = 3; break
-        case 0xC9: doCMP(e.a, readPC());           cycles = 2; break
-        case 0xCD: doCMP(e.a, read(readPCu16()));  cycles = 4; break
-        case 0xD1: doCMP(e.a, read(addrIndY()));   cycles = 5 + pageCrossed; break
-        case 0xD5: doCMP(e.a, read(addrZpX()));    cycles = 4; break
-        case 0xD9: doCMP(e.a, read(addrAbsY()));   cycles = 4 + pageCrossed; break
-        case 0xDD: doCMP(e.a, read(addrAbsX()));   cycles = 4 + pageCrossed; break
+        case 0xC1: doCMP(cpu_a, read(addrIndX())); cycles = 6; break
+        case 0xC5: doCMP(cpu_a, read(readPC()));    cycles = 3; break
+        case 0xC9: doCMP(cpu_a, readPC());           cycles = 2; break
+        case 0xCD: doCMP(cpu_a, read(readPCu16()));  cycles = 4; break
+        case 0xD1: doCMP(cpu_a, read(addrIndY()));   cycles = 5 + pageCrossed; break
+        case 0xD5: doCMP(cpu_a, read(addrZpX()));    cycles = 4; break
+        case 0xD9: doCMP(cpu_a, read(addrAbsY()));   cycles = 4 + pageCrossed; break
+        case 0xDD: doCMP(cpu_a, read(addrAbsX()));   cycles = 4 + pageCrossed; break
 
         // CPX
-        case 0xE0: doCMP(e.x, readPC());           cycles = 2; break
-        case 0xE4: doCMP(e.x, read(readPC()));     cycles = 3; break
-        case 0xEC: doCMP(e.x, read(readPCu16()));  cycles = 4; break
+        case 0xE0: doCMP(cpu_x, readPC());           cycles = 2; break
+        case 0xE4: doCMP(cpu_x, read(readPC()));     cycles = 3; break
+        case 0xEC: doCMP(cpu_x, read(readPCu16()));  cycles = 4; break
 
         // DEC
-        case 0xC6: temp = readPC();    { let v=(read(temp)-1)&0xFF; write(temp,v); e.fZero=v==0; e.fNeg=v>127; } cycles = 5; break
-        case 0xD6: temp = addrZpX();   { let v=(read(temp)-1)&0xFF; write(temp,v); e.fZero=v==0; e.fNeg=v>127; } cycles = 6; break
-        case 0xCE: temp = readPCu16(); { let v=(read(temp)-1)&0xFF; write(temp,v); e.fZero=v==0; e.fNeg=v>127; } cycles = 6; break
-        case 0xDE: temp = addrAbsX();  { let v=(read(temp)-1)&0xFF; write(temp,v); e.fZero=v==0; e.fNeg=v>127; } cycles = 7; break
+        case 0xC6: temp = readPC();    { let v=(read(temp)-1)&0xFF; write(temp,v); cpu_fZ=v==0; cpu_fN=v>127; } cycles = 5; break
+        case 0xD6: temp = addrZpX();   { let v=(read(temp)-1)&0xFF; write(temp,v); cpu_fZ=v==0; cpu_fN=v>127; } cycles = 6; break
+        case 0xCE: temp = readPCu16(); { let v=(read(temp)-1)&0xFF; write(temp,v); cpu_fZ=v==0; cpu_fN=v>127; } cycles = 6; break
+        case 0xDE: temp = addrAbsX();  { let v=(read(temp)-1)&0xFF; write(temp,v); cpu_fZ=v==0; cpu_fN=v>127; } cycles = 7; break
 
         // INC
-        case 0xE6: temp = readPC();    { let v=(read(temp)+1)&0xFF; write(temp,v); e.fZero=v==0; e.fNeg=v>127; } cycles = 5; break
-        case 0xF6: temp = addrZpX();   { let v=(read(temp)+1)&0xFF; write(temp,v); e.fZero=v==0; e.fNeg=v>127; } cycles = 6; break
-        case 0xEE: temp = readPCu16(); { let v=(read(temp)+1)&0xFF; write(temp,v); e.fZero=v==0; e.fNeg=v>127; } cycles = 6; break
-        case 0xFE: temp = addrAbsX();  { let v=(read(temp)+1)&0xFF; write(temp,v); e.fZero=v==0; e.fNeg=v>127; } cycles = 7; break
+        case 0xE6: temp = readPC();    { let v=(read(temp)+1)&0xFF; write(temp,v); cpu_fZ=v==0; cpu_fN=v>127; } cycles = 5; break
+        case 0xF6: temp = addrZpX();   { let v=(read(temp)+1)&0xFF; write(temp,v); cpu_fZ=v==0; cpu_fN=v>127; } cycles = 6; break
+        case 0xEE: temp = readPCu16(); { let v=(read(temp)+1)&0xFF; write(temp,v); cpu_fZ=v==0; cpu_fN=v>127; } cycles = 6; break
+        case 0xFE: temp = addrAbsX();  { let v=(read(temp)+1)&0xFF; write(temp,v); cpu_fZ=v==0; cpu_fN=v>127; } cycles = 7; break
 
-        case 0xC8: e.y = (e.y+1)&0xFF; e.fZero = e.y==0; e.fNeg = e.y>127; cycles = 2; break  // INY
-        case 0xCA: e.x = (e.x-1)&0xFF; e.fZero = e.x==0; e.fNeg = e.x>127; cycles = 2; break  // DEX
-        case 0xE8: e.x = (e.x+1)&0xFF; e.fZero = e.x==0; e.fNeg = e.x>127; cycles = 2; break  // INX
+        case 0xC8: cpu_y = (cpu_y+1)&0xFF; cpu_fZ = cpu_y==0; cpu_fN = cpu_y>127; cycles = 2; break  // INY
+        case 0xCA: cpu_x = (cpu_x-1)&0xFF; cpu_fZ = cpu_x==0; cpu_fN = cpu_x>127; cycles = 2; break  // DEX
+        case 0xE8: cpu_x = (cpu_x+1)&0xFF; cpu_fZ = cpu_x==0; cpu_fN = cpu_x>127; cycles = 2; break  // INX
 
-        case 0xD0: doBranchingOnPredicate(!e.fZero); break  // BNE
-        case 0xD8: e.fDec = false; cycles = 2; break         // CLD
+        case 0xD0: doBranchingOnPredicate(!cpu_fZ); break  // BNE
+        case 0xD8: cpu_fD = false; cycles = 2; break         // CLD
 
         // SBC
         case 0xE1: doSBC(read(addrIndX())); cycles = 6; break
@@ -973,7 +975,7 @@ function emulateCPU() {
         // 3-byte NOP (unofficial)
         case 0x0C: case 0x1C: case 0x3C: case 0x5C: case 0x7C: case 0xDC: case 0xFC: {
             let base = readPCu16()
-            let addr = (base + e.x) & 0xFFFF
+            let addr = (base + cpu_x) & 0xFFFF
             pageCrossed = opcode != 0x0C && (base & 0xFF00) != (addr & 0xFF00)
             cycles = 4 + pageCrossed
             break
@@ -991,19 +993,19 @@ function emulateCPU() {
             cycles = 2
             break
 
-        case 0xF0: doBranchingOnPredicate(e.fZero); break  // BEQ
-        case 0xF8: e.fDec = true; cycles = 2; break         // SED
+        case 0xF0: doBranchingOnPredicate(cpu_fZ); break  // BEQ
+        case 0xF8: cpu_fD = true; cycles = 2; break         // SED
 
         // XAA / ANE (unofficial, thermally unstable)
         case 0x8B: {
             let magic = 0xEE
             if (((Math.random()*128)|0) < 1) magic |= 0x10
             if (((Math.random()*128)|0) < 1) magic |= 0x01
-            let r = (e.a | magic) & e.x & readPC()
-            e.a = r
-            e.fZero = r == 0; e.fNeg = r > 127
-            if (((Math.random()*64)|0) < 1) e.fZero = !e.fZero
-            if (((Math.random()*64)|0) < 1) e.fNeg  = !e.fNeg
+            let r = (cpu_a | magic) & cpu_x & readPC()
+            cpu_a = r
+            cpu_fZ = r == 0; cpu_fN = r > 127
+            if (((Math.random()*64)|0) < 1) cpu_fZ = !cpu_fZ
+            if (((Math.random()*64)|0) < 1) cpu_fN  = !cpu_fN
             cycles = 2
             break
         }
@@ -1011,18 +1013,17 @@ function emulateCPU() {
         // HLT / KIL / JAM (unofficial, freezes CPU)
         case 0x02: case 0x12: case 0x22: case 0x32: case 0x42: case 0x52:
         case 0x62: case 0x72: case 0x92: case 0xB2: case 0xD2: case 0xF2:
-            e.halted = true
+            cpu_halted = true
             break
 
         default:
-            serial.println(`Illegal opcode ${opcode.toString(16)} at PC ${((e.pc - 1) & 0xFFFF).toString(16)}`)
-            e.halted = true
+            serial.println(`Illegal opcode ${opcode.toString(16)} at PC ${((cpu_pc - 1) & 0xFFFF).toString(16)}`)
+            cpu_halted = true
             break
     }
 
-    // ── Item 3: accumulate PPU budget instead of calling emulatePPU inline ──
-    e.ppuCycleBudget += cycles * 3
-    e.totalCycles    += cycles
+    // totalCycles updated here for tracelog; ppuCycleBudget is accumulated by run()
+    cpu_totalCycles += cycles
 }
 
 ///////////////////////////////////////////////////////////////////////////////
@@ -1139,7 +1140,7 @@ function renderScanline(sl) {
     const palArr    = e.palArr
     const fbArr     = e.fbArr
     // ── Item 8: frameskip — still compute sprite-0 hit but skip pixel writes ──
-    const skip      = e.skipRender
+    const skip      = ppu_skipRender
     const fbBase    = sl * 256
 
     // Sprite evaluation
@@ -1227,9 +1228,9 @@ function renderScanline(sl) {
 
 // ── Item 3: PPU budget driver (replaces per-dot emulatePPU) ──
 function stepPPU() {
-    let budget = e.ppuCycleBudget
+    let budget = ppu_cycleBudget
     if (budget <= 0) return
-    e.ppuCycleBudget = 0
+    ppu_cycleBudget = 0
 
     let dot = e.ppuDot
     let sl  = e.ppuScanline
@@ -1247,12 +1248,12 @@ function stepPPU() {
             // ppuVblank is set early at dot 1 (mid-scanline check below) for NMI timing,
             // but drawNewFrame must fire exactly once per NES frame.
             if (sl == 241) {
-                e.ppuVblank    = true
-                e.drawNewFrame = true
+                ppu_vblank    = true
+                ppu_drawNewFrame = true
             }
             // Pre-render line: clear status flags + reset Y scroll
             if (sl == 261) {
-                e.ppuVblank            = false
+                ppu_vblank            = false
                 e.ppuStatusOverflow    = false
                 e.ppuStatusSprZeroHit  = false
                 if (renderOn) ppuResetScrollY(e.vramAddr)
@@ -1276,10 +1277,10 @@ function stepPPU() {
             // drawNewFrame fires only at scanline-end above, preventing double-trigger.
             let newDot = dot + budget
             if (sl == 241 && dot < 1 && newDot >= 1) {
-                e.ppuVblank = true
+                ppu_vblank = true
             }
             if (sl == 261 && dot < 1 && newDot >= 1) {
-                e.ppuVblank           = false
+                ppu_vblank           = false
                 e.ppuStatusOverflow   = false
                 e.ppuStatusSprZeroHit = false
             }
@@ -1412,7 +1413,7 @@ function updateButtonStatus() {
 
 // ── Item 8: main loop with frameskip ──
 let frameCounter = 0
-while (!appexit && !e.halted) {
+while (!appexit && !cpu_halted) {
     sys.poke(-40, 1)
     let keyCode = sys.peek(-41)
 
@@ -1427,11 +1428,11 @@ while (!appexit && !e.halted) {
     // but pixel writes to fbArr are suppressed. Only the rendered frames are
     // flushed to the GPU.
     frameCounter++
-    e.skipRender = config.frameskip > 1 && (frameCounter % config.frameskip) != 0
+    ppu_skipRender = config.frameskip > 1 && (frameCounter % config.frameskip) != 0
 
     run()
 
-    if (!e.skipRender) {
+    if (!ppu_skipRender) {
         render()
         if (traceFile) traceFile.flush()
     }
