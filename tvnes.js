@@ -6,7 +6,7 @@ let appexit = false
 
 // config
 const config = {}
-config.frameskip = 2 // 0: invalid, 1: no skip, 2: every other frame, 3: every 3rd frame
+config.frameskip = 1 // 0: invalid, 1: no skip, 2: every other frame, 3: every 3rd frame
 config.quit = 67 // quit = backspace
 config.p1a = 62 // A = space
 config.p1b = 29 // B = a
@@ -17,6 +17,30 @@ config.p1d = 32 // DOWN = d
 config.p1l = 47 // LEFT = s
 config.p1r = 34 // RIGHT = f
 config.printTracelog = false
+
+// ── Profiler — cumulative ns per section, printed every PROF_INTERVAL rendered frames ──
+const PROF_INTERVAL = 60  // print once per ~60 rendered frames
+let prof_cpu = 0, prof_ppu = 0, prof_render = 0, prof_frames = 0
+let prof_ppu_eval = 0, prof_ppu_bgfetch = 0, prof_ppu_pixels = 0
+
+// ── CPU sub-profiler (count-based, not timer-based — one cheap ++ per event) ──
+let prof_cpu_instrs  = 0  // instructions executed this window
+let prof_cpu_cycles  = 0  // CPU cycles this window
+let prof_cpu_nmi     = 0  // NMIs fired this window
+let prof_cpu_skip    = 0  // CPU cycles skipped via spin-loop fast-forward
+// read() destination breakdown
+let prof_read_ram    = 0  // CPU RAM   ($0000–$1FFF)
+let prof_read_ppu    = 0  // PPU regs  ($2000–$3FFF)
+let prof_read_apu    = 0  // ctrl/APU  ($4016/$4017)
+let prof_read_rom    = 0  // PRG ROM   ($8000–$FFFF) via read()
+// write() destination breakdown
+let prof_write_ram   = 0  // CPU RAM
+let prof_write_ppu   = 0  // PPU regs
+let prof_write_oam   = 0  // OAM DMA   ($4014)
+let prof_write_apu   = 0  // APU/IO    ($4000–$401F, excl. DMA)
+// Per-opcode execution counts — reset each window; used for hot-instr report
+const prof_opcodeHits = new Uint32Array(256)
+let prof_wallStart = sys.nanoTime()
 
 // ── CPU registers + flags (module-level so GraalJS keeps them in machine registers) ──
 let cpu_pc = 0, cpu_sp = 0, cpu_a = 0, cpu_x = 0, cpu_y = 0
@@ -224,9 +248,9 @@ if (fullFilePath === undefined) {
 // ── Item 1: read() uses typed arrays, zero sys.peek in hot path ──
 function read(offset) {
     // CPU RAM ($0000–$1FFF, 2KB mirrored)
-    if (offset < 0x2000) return e.ramArr[offset & 0x7FF]
+    if (offset < 0x2000) { prof_read_ram++; return e.ramArr[offset & 0x7FF] }
     // PPU registers ($2000–$3FFF, mirrors of $2000–$2007)
-    if (offset < 0x4000) {
+    if (offset < 0x4000) { prof_read_ppu++;
         offset &= 0x2007
         switch (offset) {
             case 0x2002: { // PPUSTATUS
@@ -254,18 +278,20 @@ function read(offset) {
     }
     // Controller 1 ($4016) — NES shift register sends LSB first (A=bit0, B=bit1, ...)
     if (offset == 0x4016) {
+        prof_read_apu++
         let bit = e.cnt1sr & 1
         e.cnt1sr = e.cnt1sr >>> 1
         return bit
     }
     // Controller 2 ($4017)
     if (offset == 0x4017) {
+        prof_read_apu++
         let bit = e.cnt2sr & 1
         e.cnt2sr = e.cnt2sr >>> 1
         return bit
     }
     // PRG ROM ($8000–$FFFF)
-    if (offset >= 0x8000) return e.romArr[offset - 0x8000]
+    if (offset >= 0x8000) { prof_read_rom++; return e.romArr[offset - 0x8000] }
     // Unmapped
     return 0
 }
@@ -280,11 +306,12 @@ function write(offset0, value) {
     let offset = offset0 & 0xFFFF
     // CPU RAM ($0000–$1FFF, 2KB mirrored)
     if (offset < 0x2000) {
+        prof_write_ram++
         e.ramArr[offset & 0x7FF] = value
         return
     }
     // PPU registers
-    if (offset < 0x4000) {
+    if (offset < 0x4000) { prof_write_ppu++;
         offset &= 0x2007
         switch (offset) {
             case 0x2000: // PPUCTRL
@@ -370,7 +397,7 @@ function write(offset0, value) {
     if (offset < 0x4020) {
         switch (offset) {
             // ── Item 9: OAM DMA with bulk typed-array copy ──
-            case 0x4014: {
+            case 0x4014: { prof_write_oam++;
                 let src = value << 8
                 if (src < 0x2000) {
                     // RAM source — fast path using typed array
@@ -397,6 +424,7 @@ function write(offset0, value) {
                 e.cnt1sr = e.currentButtonStatus
                 e.cnt2sr = 0
                 break
+            default: prof_write_apu++; break
         }
         return
     }
@@ -615,9 +643,32 @@ function run() {
     let ppuBudget = ppu_cycleBudget
     // CPU timer sampled only at scanline boundaries (~262×/frame, not ~30k×/frame)
     let _tCpu = sys.nanoTime()
+    let lastPC = -1  // for spin-loop detection
+
     while (!cpu_halted) {
-        emulateCPU()
-        ppuBudget += cycles * 3
+        // NMI edge detection (moved here from emulateCPU so spin-loop skip can check it)
+        let prevNMI = cpu_nmiLevel
+        cpu_nmiLevel = ppu_enableNMI && ppu_vblank
+        if (!prevNMI && cpu_nmiLevel) cpu_doNMI = true
+
+        // Spin-loop fast-forward: when the CPU is stuck at the same PC (JMP-to-self)
+        // and no NMI is pending, skip the remaining PPU budget to the next scanline
+        // boundary in one shot instead of calling emulateCPU ~113 more times.
+        if (cpu_pc === lastPC && !cpu_doNMI) {
+            // dots remaining until end of this scanline
+            let remPPU  = 341 - (ppuBudget % 341)
+            // convert to CPU cycles (ceiling so we don't under-shoot the boundary)
+            let skipCyc = ((remPPU + 2) / 3) | 0
+            ppuBudget       += skipCyc * 3
+            cpu_totalCycles += skipCyc
+            prof_cpu_cycles += skipCyc
+            prof_cpu_skip   += skipCyc
+        } else {
+            lastPC = cpu_pc
+            emulateCPU()
+            ppuBudget += cycles * 3
+        }
+
         if (ppuBudget >= 341) {
             prof_cpu += sys.nanoTime() - _tCpu
             ppu_cycleBudget = ppuBudget
@@ -629,6 +680,7 @@ function run() {
                 ppu_drawNewFrame = false
                 break
             }
+            lastPC = -1  // reset after each scanline so the skip doesn't bleed across
             _tCpu = sys.nanoTime()
         }
     }
@@ -747,11 +799,6 @@ function unpackFlags(val) {
 ///////////////////////////////////////////////////////////////////////////////
 // ── Items 4, 6, 10: emulateCPU with fast opcode fetch, inlined flags ──
 function emulateCPU() {
-    // NMI edge detection
-    let prevNMIlevel = cpu_nmiLevel
-    cpu_nmiLevel = ppu_enableNMI && ppu_vblank
-    if (!prevNMIlevel && cpu_nmiLevel) cpu_doNMI = true
-
     let opcode
     if (!cpu_doNMI) {
         // ── Item 10: fast opcode fetch from ROM without going through read() ──
@@ -767,13 +814,17 @@ function emulateCPU() {
         opcode = 0x00
     }
 
+    prof_cpu_instrs++
+    prof_opcodeHits[opcode]++
+
     if (config.printTracelog) printTracelog(opcode)
 
     switch (opcode) {
 
         // BRK / NMI / IRQ handler
         case 0x00:
-            if (!cpu_doNMI) incPC()  // skip padding byte
+            if (cpu_doNMI) prof_cpu_nmi++
+            else incPC()  // skip padding byte
             pushPC()
             push(packFlags(true))
             cpu_pc    = cpu_doNMI ? (read(0xFFFA) | (read(0xFFFB) << 8)) : (read(0xFFFE) | (read(0xFFFF) << 8))
@@ -1037,7 +1088,8 @@ function emulateCPU() {
     }
 
     // totalCycles updated here for tracelog; ppuCycleBudget is accumulated by run()
-    cpu_totalCycles += cycles
+    prof_cpu_cycles  += cycles
+    cpu_totalCycles  += cycles
 }
 
 ///////////////////////////////////////////////////////////////////////////////
@@ -1482,12 +1534,6 @@ function updateButtonStatus() {
     e.currentButtonStatus = status
 }
 
-// ── Profiler — cumulative ns per section, printed every PROF_INTERVAL rendered frames ──
-const PROF_INTERVAL = 60  // print once per ~60 rendered frames
-let prof_cpu = 0, prof_ppu = 0, prof_render = 0, prof_frames = 0
-let prof_ppu_eval = 0, prof_ppu_bgfetch = 0, prof_ppu_pixels = 0
-let prof_wallStart = sys.nanoTime()
-
 // ── Item 8: main loop with frameskip ──
 let frameCounter = 0
 while (!appexit && !cpu_halted) {
@@ -1532,8 +1578,50 @@ while (!appexit && !cpu_halted) {
             let pctPx     = pp ? ((prof_ppu_pixels  * 100 / prof_ppu + 0.5) | 0) : 0
             let pctOther  = pp ? ((ppuOther          * 100 / prof_ppu + 0.5) | 0) : 0
             serial.println(`[prof] ${fps} fps | ${msPerFrame}ms/frame | CPU:${pctCPU}% PPU:${pctPPU}%(eval:${pctEval}% bg:${pctBG}% px:${pctPx}% misc:${pctOther}%) render:${pctRender}%`)
+
+            // ── CPU sub-report ──
+            const fi = prof_frames  // rendered-frame count this window
+            const iPerFr  = fi > 0 ? ((prof_cpu_instrs / fi + 0.5) | 0) : 0
+            const cPerFr  = fi > 0 ? ((prof_cpu_cycles  / fi + 0.5) | 0) : 0
+            const nmiPerFr= fi > 0 ? ((prof_cpu_nmi * 10 / fi + 0.5) | 0) / 10 : 0
+            const cycTotal = prof_cpu_cycles + prof_cpu_skip
+            const pctSkip = cycTotal > 0 ? ((prof_cpu_skip * 100 / cycTotal + 0.5) | 0) : 0
+            // read() breakdown
+            const rTot = prof_read_ram + prof_read_ppu + prof_read_apu + prof_read_rom
+            const rp = rTot > 0
+            const pctRdRAM  = rp ? ((prof_read_ram * 100 / rTot + 0.5) | 0) : 0
+            const pctRdPPU  = rp ? ((prof_read_ppu * 100 / rTot + 0.5) | 0) : 0
+            const pctRdAPU  = rp ? ((prof_read_apu * 100 / rTot + 0.5) | 0) : 0
+            const pctRdROM  = rp ? ((prof_read_rom * 100 / rTot + 0.5) | 0) : 0
+            // write() breakdown
+            const wTot = prof_write_ram + prof_write_ppu + prof_write_oam + prof_write_apu
+            const wp = wTot > 0
+            const pctWrRAM  = wp ? ((prof_write_ram * 100 / wTot + 0.5) | 0) : 0
+            const pctWrPPU  = wp ? ((prof_write_ppu * 100 / wTot + 0.5) | 0) : 0
+            const pctWrOAM  = wp ? ((prof_write_oam * 100 / wTot + 0.5) | 0) : 0
+            const pctWrAPU  = wp ? ((prof_write_apu * 100 / wTot + 0.5) | 0) : 0
+            serial.println(`[cpu ] ${iPerFr} i/fr  ${cPerFr} c/fr  NMI:${nmiPerFr}/fr  skip:${pctSkip}% | reads(${rTot > 0 ? ((rTot/fi+0.5)|0) : 0}/fr): RAM:${pctRdRAM}% PPU:${pctRdPPU}% ROM:${pctRdROM}% ctrl:${pctRdAPU}% | writes(${wTot > 0 ? ((wTot/fi+0.5)|0) : 0}/fr): RAM:${pctWrRAM}% PPU:${pctWrPPU}% OAM:${pctWrOAM}% APU:${pctWrAPU}%`)
+
+            // ── Top-8 hottest opcodes ──
+            let hotOps = []
+            for (let op = 0; op < 256; op++) {
+                if (prof_opcodeHits[op] > 0) hotOps.push([op, prof_opcodeHits[op]])
+            }
+            hotOps.sort((a, b) => b[1] - a[1])
+            const totalInstrs = prof_cpu_instrs
+            const hotStr = hotOps.slice(0, 8).map(([op, cnt]) => {
+                const pct = totalInstrs > 0 ? ((cnt * 100 / totalInstrs + 0.5) | 0) : 0
+                return `${OPCODE_NAMES[op] || '???'}($${op.toString(16).padStart(2,'0')}):${pct}%`
+            }).join('  ')
+            serial.println(`[cpu ] hot: ${hotStr}`)
+
+            // reset all CPU sub-counters
             prof_cpu = 0; prof_ppu = 0; prof_render = 0; prof_frames = 0
             prof_ppu_eval = 0; prof_ppu_bgfetch = 0; prof_ppu_pixels = 0
+            prof_cpu_instrs = 0; prof_cpu_cycles = 0; prof_cpu_nmi = 0; prof_cpu_skip = 0
+            prof_read_ram = 0; prof_read_ppu = 0; prof_read_apu = 0; prof_read_rom = 0
+            prof_write_ram = 0; prof_write_ppu = 0; prof_write_oam = 0; prof_write_apu = 0
+            prof_opcodeHits.fill(0)
             prof_wallStart = sys.nanoTime()
         }
     }
