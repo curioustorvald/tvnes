@@ -296,6 +296,10 @@ function write(offset0, value) {
                 ppu_enableNMI        = (value & 128) != 0
                 // propagate NT bits into _tempVramAddr bits 10–11
                 e._tempVramAddr = (e._tempVramAddr & 0b0111001111111111) | ((value & 3) << 10)
+                // also mirror into transferAddr: SMB writes PPUSCROLL before the final PPUCTRL,
+                // so transferAddr picks up wrong NT bits from the last PPUADDR high byte unless
+                // we correct them here.
+                e.transferAddr  = (e.transferAddr  & 0b0111001111111111) | ((value & 3) << 10)
                 break
             case 0x2001: // PPUMASK
                 e.ppuMask8pxMaskBG      = (value & 2)  != 0
@@ -324,7 +328,8 @@ function write(offset0, value) {
                 break
             case 0x2006: // PPUADDR
                 if (!e.writeLatch) {
-                    e._tempVramAddr = (value & 0x3F) << 8
+                    // Preserve bits 7:0 of _tempVramAddr (NES hardware leaves them intact)
+                    e._tempVramAddr = (e._tempVramAddr & 0x00FF) | ((value & 0x3F) << 8)
                     e.writeLatch    = true
                 } else {
                     let w = e._tempVramAddr | value
@@ -456,6 +461,8 @@ function reset() {
     let PCH = read(0xFFFD)
     cpu_pc = (PCH << 8) | PCL
     cpu_sp = 0xFD
+
+    buildSpriteSchedule()  // OAM is all-zero at boot; pre-build so first frame has a valid schedule
 
     // ── Item 11: open trace file and emit RESET line ──
     if (config.printTracelog) {
@@ -606,13 +613,13 @@ function run() {
     // stepPPU is only called when the budget reaches a scanline boundary (341 dots),
     // reducing calls from ~10k/frame to ~262/frame (one per scanline).
     let ppuBudget = ppu_cycleBudget
+    // CPU timer sampled only at scanline boundaries (~262×/frame, not ~30k×/frame)
+    let _tCpu = sys.nanoTime()
     while (!cpu_halted) {
-        let t0 = sys.nanoTime()
         emulateCPU()
-        prof_cpu += sys.nanoTime() - t0
-
         ppuBudget += cycles * 3
         if (ppuBudget >= 341) {
+            prof_cpu += sys.nanoTime() - _tCpu
             ppu_cycleBudget = ppuBudget
             let t1 = sys.nanoTime()
             stepPPU()
@@ -622,8 +629,10 @@ function run() {
                 ppu_drawNewFrame = false
                 break
             }
+            _tCpu = sys.nanoTime()
         }
     }
+    prof_cpu += sys.nanoTime() - _tCpu  // charge remaining CPU work after last PPU tick
     ppu_cycleBudget = ppuBudget
     if (cpu_halted) serial.println('CPU Halted')
 }
@@ -1052,25 +1061,6 @@ function readPPU(vramAddr) {
     }
 }
 
-function findCHRaddrForSprite(slot, ppuScanline) {
-    if (!e.ppuUse8x16Sprites) {
-        let row = ppuScanline - e.ppuSpritePosY[slot]
-        let flipped = ((e.ppuSpriteAtr[slot] >>> 7) & 1) != 0
-        if (flipped) row = 7 - row
-        return (e.ppuSpritePatternTable ? 0x1000 : 0) | (e.ppuSpritePtn[slot] << 4) | row
-    } else {
-        let row = ppuScanline - e.ppuSpritePosY[slot]
-        let flipped = ((e.ppuSpriteAtr[slot] >>> 7) & 1) != 0
-        let ptnBase = ((e.ppuSpritePtn[slot] & 1) ? 0x1000 : 0) | ((e.ppuSpritePtn[slot] & 0xFE) << 4)
-        if (!flipped) {
-            if (row < 8) return ptnBase + row
-            else         return ptnBase + 16 + (row & 7)
-        } else {
-            if (row < 8) return ptnBase + 16 + (7 - row)
-            else         return ptnBase + (7 - (row & 7))
-        }
-    }
-}
 
 ///////////////////////////////////////////////////////////////////////////////
 // ── Item 3: per-scanline renderer replacing per-dot emulatePPU ──
@@ -1079,60 +1069,102 @@ function findCHRaddrForSprite(slot, ppuScanline) {
 const bgTileLo   = new Uint8Array(34)
 const bgTileHi   = new Uint8Array(34)
 const bgTileAttr = new Uint8Array(34)
+// Pre-allocated sprite line buffers: filled once per scanline, read O(1) per pixel
+const sprLinePalLo = new Uint8Array(256)  // 2-bit pixel (0 = transparent)
+const sprLinePalHi = new Uint8Array(256)  // palette high bits (4-7 for sprites)
+const sprLineFlags = new Uint8Array(256)  // bit 0 = in-front priority, bit 1 = sprite-zero pixel
 
-// ── Item 3: evaluate sprites for one scanline (called once per visible line) ──
-function evalSpritesForScanline(sl) {
+// ── Sprite schedule: pre-built once per frame at the pre-render scanline ──
+// Replaces the 64-entry OAM scan on every visible scanline (15,360 checks/frame)
+// with a pre-indexed lookup: typically 0-4 sprites per scanline for mapper-0 games.
+const sprSchedCount = new Uint8Array(240)       // active sprite slots per scanline
+const sprSchedIdx   = new Uint8Array(240 * 8)  // OAM indices [0..63], up to 8 per scanline
+
+function buildSpriteSchedule() {
     const oamArr = e.oamArr
     const sprH   = e.ppuUse8x16Sprites ? 16 : 8
+    sprSchedCount.fill(0, 0, 240)
+    for (let i = 0; i < 64; i++) {
+        const y    = oamArr[i * 4]
+        const yEnd = y + sprH
+        for (let sl = y; sl < yEnd; sl++) {
+            if (sl >= 240) break
+            const cnt = sprSchedCount[sl]
+            if (cnt < 8) {
+                sprSchedIdx[sl * 8 + cnt] = i
+                sprSchedCount[sl] = cnt + 1
+            } else {
+                e.ppuStatusOverflow = true  // only fires if > 8 sprites on this line
+            }
+        }
+    }
+}
+
+// ── Item 3: evaluate sprites for one scanline — uses pre-built schedule ──
+function evalSpritesForScanline(sl) {
+    const count = sprSchedCount[sl]
     const shL = e.ppuSpriteShiftRegL
     const shH = e.ppuSpriteShiftRegH
-    const atr = e.ppuSpriteAtr
     const px  = e.ppuSpritePosX
+
+    if (count == 0) {
+        e.ppuScanlineContainsSprZero = false
+        for (let i = 0; i < 8; i++) { shL[i] = 0; shH[i] = 0; px[i] = 0xFF }
+        e.ppuSecondaryOAMsize = 0
+        return 0
+    }
+
+    const oamArr    = e.oamArr
+    const chrArr    = e.chrArr
+    const use8x16   = e.ppuUse8x16Sprites
+    const sprPTbase = e.ppuSpritePatternTable ? 0x1000 : 0
+    const atr = e.ppuSpriteAtr
     const py  = e.ppuSpritePosY
+    const ptn = e.ppuSpritePtn
+    const schedBase = sl * 8
 
-    let slot = 0
-    e.ppuScanlineContainsSprZero = false
-    // Note: e.ppuStatusOverflow is a frame-level flag; cleared at sl 261, not here
+    // Sprite-zero is on this scanline iff the lowest OAM-index sprite here is sprite 0.
+    // (Schedule is built in OAM order, so if sprite 0 hits this scanline it's at slot 0.)
+    const sprZero = sprSchedIdx[schedBase] == 0
 
-    for (let i = 0; i < 64; i++) {
-        let y   = oamArr[i * 4]
-        let row = sl - y
-        if (row < 0 || row >= sprH) continue
+    for (let slot = 0; slot < count; slot++) {
+        const i     = sprSchedIdx[schedBase + slot]
+        const base  = i * 4
+        const y     = oamArr[base]
+        const row   = sl - y
+        const spritePtn = oamArr[base + 1]
+        const attrs = oamArr[base + 2]
+        const posX  = oamArr[base + 3]
 
-        if (i == 0) e.ppuScanlineContainsSprZero = true
+        atr[slot] = attrs
+        px[slot]  = posX
+        py[slot]  = y
+        ptn[slot] = spritePtn
 
-        if (slot >= 8) {
-            e.ppuStatusOverflow = true
-            continue
+        // CHR address (inlined, sprite addresses always < 0x2000 → direct chrArr)
+        let chrAddr
+        if (!use8x16) {
+            let r = (attrs & 0x80) != 0 ? 7 - row : row  // vertical flip
+            chrAddr = sprPTbase | (spritePtn << 4) | r
+        } else {
+            const ptnBase = ((spritePtn & 1) ? 0x1000 : 0) | ((spritePtn & 0xFE) << 4)
+            chrAddr = (attrs & 0x80) == 0
+                ? (row < 8 ? ptnBase + row        : ptnBase + 16 + (row & 7))
+                : (row < 8 ? ptnBase + 16 + (7-row) : ptnBase + (7 - (row & 7)))
         }
 
-        let ptn   = oamArr[i * 4 + 1]
-        let attrs = oamArr[i * 4 + 2]
-        let posX  = oamArr[i * 4 + 3]
-
-        atr[slot]           = attrs
-        px[slot]            = posX
-        py[slot]            = y
-        e.ppuSpritePtn[slot] = ptn
-
-        let chrAddr = findCHRaddrForSprite(slot, sl)
-        let lo = readPPU(chrAddr)
-        let hi = readPPU(chrAddr + 8)
-
-        // ── Item 7: bit-reverse LUT for horizontal flip ──
+        let lo = chrArr[chrAddr]      // direct: sprite CHR always in pattern table
+        let hi = chrArr[chrAddr + 8]
         if ((attrs & 0x40) != 0) { lo = bitRev8[lo]; hi = bitRev8[hi] }
 
         shL[slot] = lo
         shH[slot] = hi
-        slot++
     }
 
-    // Clear unused sprite slots
-    for (let i = slot; i < 8; i++) {
-        shL[i] = 0; shH[i] = 0; px[i] = 0xFF
-    }
-    e.ppuSecondaryOAMsize = slot * 4
-    return slot
+    e.ppuScanlineContainsSprZero = sprZero
+    for (let i = count; i < 8; i++) { shL[i] = 0; shH[i] = 0; px[i] = 0xFF }
+    e.ppuSecondaryOAMsize = count * 4
+    return count
 }
 
 // ── Item 3: render one complete scanline ──
@@ -1144,6 +1176,10 @@ function renderScanline(sl) {
     const fineX     = e.ppuScrollFineX
     const palArr    = e.palArr
     const fbArr     = e.fbArr
+    const chrArr    = e.chrArr
+    const vramArr   = e.vramArr
+    // Nametable mirroring mode (constant per ROM, hoisted out of readPPU)
+    const hMirror   = (e.inesHdr[6] & 1) == 0  // true = horizontal, false = vertical
     // ── Item 8: frameskip — still compute sprite-0 hit but skip pixel writes ──
     const skip      = ppu_skipRender
     const fbBase    = sl * 256
@@ -1162,18 +1198,26 @@ function renderScanline(sl) {
         let va = e.vramAddr
         const highPT = e.ppuBGPatternTable
         for (let tile = 0; tile < 33; tile++) {
-            let tileId = readPPU(0x2000 | (va & 0x0FFF))
+            // Nametable read — inline readPPU for 0x2000–0x3EFF range
+            const ntAddr = 0x2000 | (va & 0x0FFF)
+            const tileId = hMirror
+                ? vramArr[(ntAddr & 0x3FF) | ((ntAddr & 0x800) >>> 1)]
+                : vramArr[ntAddr & 0x7FF]
 
-            let atAddr = 0x23C0 | (va & 0x0C00) | ((va >>> 4) & 0x38) | ((va >>> 2) & 0x07)
-            let attr   = readPPU(atAddr)
-            if (va & 2)           attr >>>= 2  // right half of attr cell
-            if ((va >>> 5) & 2)   attr >>>= 4  // bottom half of attr cell
+            // Attribute read — same mirroring
+            const atAddr = 0x23C0 | (va & 0x0C00) | ((va >>> 4) & 0x38) | ((va >>> 2) & 0x07)
+            let attr = hMirror
+                ? vramArr[(atAddr & 0x3FF) | ((atAddr & 0x800) >>> 1)]
+                : vramArr[atAddr & 0x7FF]
+            if (va & 2)         attr >>>= 2  // right half of attr cell
+            if ((va >>> 5) & 2) attr >>>= 4  // bottom half of attr cell
             attr &= 3
 
-            let fineY    = (va >>> 12) & 7
-            let ptnBase  = (highPT ? 0x1000 : 0) | (tileId << 4) | fineY
-            bgTileLo[tile]   = readPPU(ptnBase)
-            bgTileHi[tile]   = readPPU(ptnBase + 8)
+            // Pattern reads — always < 0x2000, direct chrArr access
+            const fineY  = (va >>> 12) & 7
+            const ptnBase = (highPT ? 0x1000 : 0) | (tileId << 4) | fineY
+            bgTileLo[tile]   = chrArr[ptnBase]
+            bgTileHi[tile]   = chrArr[ptnBase + 8]
             bgTileAttr[tile] = attr
 
             // Advance coarse X
@@ -1181,59 +1225,72 @@ function renderScanline(sl) {
             else                   va++
         }
     }
-
     prof_ppu_bgfetch += sys.nanoTime() - _t1
 
-    // Pixel loop
+    // Pre-build sprite line: O(sprSlots × 8) ≤ 64 ops, so pixel loop needs no inner scan.
+    // Higher-priority (lower index) sprites win; first opaque write per dot wins.
     let _t2 = sys.nanoTime()
+    sprLinePalLo.fill(0, 0, 256)
+    if (renderSpr) {
+        for (let i = 0; i < sprSlots; i++) {
+            const startDot = sPx[i]
+            if (startDot >= 256) continue
+            const loB = shL[i], hiB = shH[i]
+            const isZero = (i == 0 && sprZeroThisSl) ? 2 : 0
+            const prio   = (sAtr[i] & 0x20) == 0 ? 1 : 0  // 1 = in front of BG
+            const palH   = (sAtr[i] & 3) | 4              // sprite palettes 4-7
+            for (let b = 7; b >= 0; b--) {
+                const dot = startDot + (7 - b)
+                if (dot >= 256) break
+                if (sprLinePalLo[dot] != 0) continue       // higher-priority sprite already here
+                const sLo = (loB >>> b) & 1
+                const sHi = (hiB >>> b) & 1
+                const sPL = (sHi << 1) | sLo
+                if (sPL == 0) continue                     // transparent
+                sprLinePalLo[dot] = sPL
+                sprLinePalHi[dot] = palH
+                sprLineFlags[dot] = prio | isZero
+            }
+        }
+    }
+    prof_ppu_pixels += sys.nanoTime() - _t2  // counts pre-build as "pixels" work
+
+    // Pixel loop — O(256), O(1) sprite lookup per dot
+    let _t3 = sys.nanoTime()
+    let sprHitPending = sprZeroThisSl  // false once hit fires (fires at most once per scanline)
     for (let dot = 0; dot < 256; dot++) {
         // BG pixel
         let palLo = 0, palHi = 0
         if (renderBG && (dot >= 8 || !maskBG8)) {
-            let eff = dot + fineX
-            let t   = eff >>> 3
-            let b   = 7 - (eff & 7)
-            let lo  = (bgTileLo[t]   >>> b) & 1
-            let hi  = (bgTileHi[t]   >>> b) & 1
-            palLo   = (hi << 1) | lo
-            palHi   = palLo != 0 ? bgTileAttr[t] : 0
+            const eff = dot + fineX
+            const t   = eff >>> 3
+            const b   = 7 - (eff & 7)
+            const lo  = (bgTileLo[t] >>> b) & 1
+            const hi  = (bgTileHi[t] >>> b) & 1
+            palLo     = (hi << 1) | lo
+            palHi     = palLo != 0 ? bgTileAttr[t] : 0
         }
 
-        // Sprite pixel
-        let spritePalLo = 0, spritePalHi = 0, spritePriority = false
-        if (renderSpr && (dot >= 8 || !maskSp8)) {
-            for (let i = 0; i < sprSlots; i++) {
-                let sdot = dot - sPx[i]
-                if (sdot < 0 || sdot >= 8) continue
-                let b    = 7 - sdot
-                let sLo  = (shL[i] >>> b) & 1
-                let sHi  = (shH[i] >>> b) & 1
-                let sPL  = (sHi << 1) | sLo
-                if (sPL == 0) continue  // transparent pixel
-
-                // Sprite-0 hit detection
-                if (i == 0 && sprZeroThisSl && palLo != 0 && dot < 255) {
-                    e.ppuStatusSprZeroHit = true
-                }
-
-                spritePalLo  = sPL
-                spritePalHi  = (sAtr[i] & 3) | 4  // sprite palettes are indices 4-7
-                spritePriority = (sAtr[i] & 0x20) == 0  // priority bit: 0 = in front
-                break
-            }
-        }
-
-        // BG vs sprite mux
+        // Sprite pixel (O(1): single array read)
         let finalLo = palLo, finalHi = palHi
-        if ((spritePriority && spritePalLo != 0) || palLo == 0) {
-            finalLo = spritePalLo
-            finalHi = spritePalHi
-            if (finalLo == 0) finalHi = 0
+        if (renderSpr && (dot >= 8 || !maskSp8)) {
+            const sLo = sprLinePalLo[dot]
+            if (sLo != 0) {
+                const flags = sprLineFlags[dot]
+                if (sprHitPending && (flags & 2) != 0 && palLo != 0 && dot < 255) {
+                    e.ppuStatusSprZeroHit = true
+                    sprHitPending = false
+                }
+                if ((flags & 1) != 0 || palLo == 0) {  // sprite in front, or BG transparent
+                    finalLo = sLo
+                    finalHi = sprLinePalHi[dot]
+                }
+            }
         }
 
         if (!skip) fbArr[fbBase + dot] = palArr[finalHi * 4 + finalLo]
     }
-    prof_ppu_pixels += sys.nanoTime() - _t2
+    prof_ppu_pixels += sys.nanoTime() - _t3
 }
 
 // ── Item 3: PPU budget driver (replaces per-dot emulatePPU) ──
@@ -1261,12 +1318,16 @@ function stepPPU() {
                 ppu_vblank    = true
                 ppu_drawNewFrame = true
             }
-            // Pre-render line: clear status flags + reset Y scroll
+            // Pre-render line: clear status flags + reset Y scroll + rebuild sprite schedule
             if (sl == 261) {
                 ppu_vblank            = false
                 e.ppuStatusOverflow    = false
                 e.ppuStatusSprZeroHit  = false
-                if (renderOn) ppuResetScrollY(e.vramAddr)
+                if (renderOn) {
+                    ppuResetScrollY(e.vramAddr)
+                    ppuResetScrollX(e.vramAddr)  // dot-257 equivalent on pre-render scanline
+                }
+                buildSpriteSchedule()  // OAM stable after vblank; pre-index for next frame
             }
             // Visible scanlines: render then update scrolling
             if (sl < 240) {
