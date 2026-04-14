@@ -1477,9 +1477,11 @@ function fbToGPU() {
 
 function uploadNESmasterPal() {
     let twoc02 = [0x666F,0x019F,0x10AF,0x409F,0x606F,0x602F,0x600F,0x410F,0x230F,0x040F,0x040F,0x041F,0x035F,0x000F,0x000F,0x000F,0xAAAF,0x04DF,0x32FF,0x71FF,0x90BF,0xB16F,0xA20F,0x840F,0x560F,0x270F,0x080F,0x083F,0x069F,0x000F,0x000F,0x000F,0xFFFF,0x5AFF,0x88FF,0xB6FF,0xD6FF,0xF6CF,0xF76F,0xD92F,0xBA0F,0x8C0F,0x5D2F,0x3D6F,0x3CCF,0x444F,0x000F,0x000F,0xFFFF,0xBEFF,0xCDFF,0xECFF,0xFCFF,0xFCEF,0xFCCF,0xFDAF,0xED9F,0xDE9F,0xCEAF,0xBECF,0xBEEF,0xBBBF,0x000F,0x000F]
+    let twoc03 = [0x666F,0x029F,0x00DF,0x64DF,0x906F,0xB06F,0xB20F,0x940F,0x640F,0x240F,0x062F,0x090F,0x044F,0x000F,0x000F,0x000F,0xBBBF,0x06DF,0x04FF,0x90FF,0xB0FF,0xF09F,0xF00F,0xD60F,0x960F,0x290F,0x090F,0x0B6F,0x099F,0x000F,0x000F,0x000F,0xFFFF,0x6BFF,0x99FF,0xD6FF,0xF0FF,0xF6FF,0xF90F,0xFB0F,0xDD0F,0x6D0F,0x0F0F,0x4FDF,0x0FFF,0x000F,0x000F,0x000F,0xFFFF,0xBDFF,0xDBFF,0xFBFF,0xF9FF,0xFBBF,0xFD9F,0xFF4F,0xFF6F,0xBF4F,0x9F6F,0x4FDF,0x9DFF,0x000F,0x000F,0x000F]
+    let pal = twoc02
     for (let i = 0; i < 64; i++) {
-        let rg   = (twoc02[i] >>> 8) & 0xFF
-        let ba   = twoc02[i] & 0xFF
+        let rg   = (pal[i] >>> 8) & 0xFF
+        let ba   = pal[i] & 0xFF
         let addr = -(1310209 + 2*i)
         sys.poke(addr, rg); sys.poke(addr - 1, ba)
     }
@@ -1487,11 +1489,19 @@ function uploadNESmasterPal() {
 
 ///////////////////////////////////////////////////////////////////////////////
 
+graphics.setBackground(0,0,0)
 graphics.setGraphicsMode(1)
 uploadNESmasterPal()
 con.curs_set(0)
 graphics.clearText()
 graphics.setCursorYX(19, 1)
+
+for (let px = 0; px < 20; px++) {
+    for (let py = 0; py < 224; py++) {
+        graphics.plotPixelMode1(px, py, 240, 1)
+        graphics.plotPixelMode1(280 - px, py, 240, 1)
+    }
+}
 
 reset()
 
@@ -1514,6 +1524,13 @@ function updateButtonStatus() {
 
 // ── Item 8: main loop with frameskip ──
 let frameCounter = 0
+// ── Speed regulator: pace to NES NTSC frame rate (60.0988 fps ≈ 16.639ms/frame) ──
+// Slowdown is allowed (if the emulator is slower than real time we just run flat-out);
+// fast-forward is prevented by sleeping the remainder of each frame's wall-clock budget.
+// sys.sleep(ms) adds ~4ms of internal overhead (trailing Thread.sleep(4L) in the
+// Kotlin bridge), so only sleep when we have >4ms of slack and subtract that overhead.
+const NES_FRAME_NS = 16639267  // 1e9 / 60.0988
+let speedTarget = sys.nanoTime() + NES_FRAME_NS
 while (!appexit && !cpu_halted) {
     sys.poke(-40, 1)
     let keyCode = sys.peek(-41)
@@ -1546,21 +1563,37 @@ while (!appexit && !cpu_halted) {
             let total = prof_cpu + prof_ppu + prof_render
             let pctCPU    = total > 0 ? ((prof_cpu    * 100 / total + 0.5) | 0) : 0
             let pctPPU    = total > 0 ? ((prof_ppu    * 100 / total + 0.5) | 0) : 0
-            let pctRender = total > 0 ? ((prof_render * 100 / total + 0.5) | 0) : 0
-            let msPerFrame = total > 0 ? ((total / prof_frames / 1e6 * 10 + 0.5) | 0) / 10 : 0
-            serial.println(`[prof] ${fps} fps | ${msPerFrame}ms/frame | CPU:${pctCPU}% PPU:${pctPPU}% render:${pctRender}%`)
+            // let pctRender = total > 0 ? ((prof_render * 100 / total + 0.5) | 0) : 0
+            // let msPerFrame = total > 0 ? ((total / prof_frames / 1e6 * 10 + 0.5) | 0) / 10 : 0
+            // serial.println(`[prof] ${fps} fps | ${msPerFrame}ms/frame | CPU:${pctCPU}% PPU:${pctPPU}% render:${pctRender}%`)
 
             // ── CPU sub-report ──
             const fi = prof_frames  // rendered-frame count this window
-            const iPerFr  = fi > 0 ? ((prof_cpu_instrs / fi + 0.5) | 0) : 0
+            // const iPerFr  = fi > 0 ? ((prof_cpu_instrs / fi + 0.5) | 0) : 0
             const cPerFr  = fi > 0 ? ((prof_cpu_cycles  / fi + 0.5) | 0) : 0
-            const nmiPerFr= fi > 0 ? ((prof_cpu_nmi * 10 / fi + 0.5) | 0) / 10 : 0
+            // const nmiPerFr= fi > 0 ? ((prof_cpu_nmi * 10 / fi + 0.5) | 0) / 10 : 0
             const cycTotal = prof_cpu_cycles + prof_cpu_skip
             const pctSkip = cycTotal > 0 ? ((prof_cpu_skip * 100 / cycTotal + 0.5) | 0) : 0
-            serial.println(`[cpu ] ${iPerFr} i/fr  ${cPerFr} c/fr  NMI:${nmiPerFr}/fr  skip:${pctSkip}%`)
+            // serial.println(`[cpu ] ${iPerFr} i/fr  ${cPerFr} c/fr  NMI:${nmiPerFr}/fr  skip:${pctSkip}%`)
+
+
+            graphics.setCursorYX(1, 1)
+            println("FPS")
+            println(fps+"      ")
+            println("CPU")
+            println(pctCPU+"       ")
+            println("PPU")
+            println(pctPPU+"       ")
+            println("SKIP")
+            println(pctSkip+"       ")
+
+            graphics.setCursorYX(1, 78)
+            println("CYC")
+            graphics.setCursorYX(2, 76)
+            println(cPerFr)
 
             // ── Top-8 hottest opcodes ──
-            let hotOps = []
+            /*let hotOps = []
             for (let op = 0; op < 256; op++) {
                 if (prof_opcodeHits[op] > 0) hotOps.push([op, prof_opcodeHits[op]])
             }
@@ -1572,12 +1605,31 @@ while (!appexit && !cpu_halted) {
             }).join('  ')
             serial.println(`[cpu ] hot: ${hotStr}`)
 
+            for (let i = 0; i < 8; i++) {
+                graphics.setCursorYX(4+i, 78)
+                println(OPCODE_NAMES[hotOps[i][0]])
+            }*/
+
             // reset all CPU sub-counters
-            prof_cpu = 0; prof_ppu = 0; prof_render = 0; prof_frames = 0
-            prof_cpu_instrs = 0; prof_cpu_cycles = 0; prof_cpu_nmi = 0; prof_cpu_skip = 0
-            prof_opcodeHits.fill(0)
+            prof_cpu = 0; prof_ppu = 0; prof_render = 0; prof_frames = 0; prof_cpu_cycles = 0; prof_cpu_skip = 0
+            // prof_cpu_instrs = 0; prof_cpu_nmi = 0;
+            // prof_opcodeHits.fill(0)
             prof_wallStart = sys.nanoTime()
         }
+    }
+
+    // ── Speed regulator: sleep off any slack vs. the real-time NES frame budget ──
+    let nowNs = sys.nanoTime()
+    let remNs = speedTarget - nowNs
+    if (remNs > 0) {
+        let remMs = (remNs / 1e6) | 0
+        if (remMs > 4) sys.sleep(remMs - 4)  // subtract the ~4ms sys.sleep overhead
+        speedTarget += NES_FRAME_NS
+    } else if (-remNs > NES_FRAME_NS) {
+        // Running more than a full frame behind — don't try to fast-forward, reset anchor.
+        speedTarget = nowNs + NES_FRAME_NS
+    } else {
+        speedTarget += NES_FRAME_NS
     }
 }
 
