@@ -17,10 +17,15 @@ config.p1d = 32 // DOWN = d
 config.p1l = 47 // LEFT = s
 config.p1r = 34 // RIGHT = f
 config.printTracelog = false
+config.audioEnable = true
+config.audioVolume = 255  // 0–255; passed to audio.setMasterVolume for both playheads
+
+// ── LibPSG (PSG synthesiser for NES PSG channels → Audio Adapter Playhead 0) ──
+const psg = require("psg")
 
 // ── Profiler — cumulative ns per section, printed every PROF_INTERVAL rendered frames ──
 const PROF_INTERVAL = 60  // print once per ~60 rendered frames
-let prof_cpu = 0, prof_ppu = 0, prof_render = 0, prof_frames = 0
+let prof_cpu = 0, prof_ppu = 0, prof_apu = 0, prof_render = 0, prof_frames = 0
 
 // ── CPU sub-profiler (count-based, not timer-based — one cheap ++ per event) ──
 let prof_cpu_instrs  = 0  // instructions executed this window
@@ -36,10 +41,70 @@ let cpu_pc = 0, cpu_sp = 0, cpu_a = 0, cpu_x = 0, cpu_y = 0
 let cpu_fC = false, cpu_fZ = false, cpu_fN = false, cpu_fV = false, cpu_fI = false, cpu_fD = false
 let cpu_halted = false
 let cpu_nmiLevel = false, cpu_doNMI = false, cpu_nmiFired = 0
+let cpu_irqLevel = false, cpu_doIRQ = false  // level-triggered IRQ (MMC3)
 let cpu_totalCycles = 0
 // ── Hot PPU/loop flags hoisted out of e (read every CPU instruction or every scanline) ──
 let ppu_vblank = false, ppu_enableNMI = false
 let ppu_cycleBudget = 0, ppu_drawNewFrame = false, ppu_skipRender = false
+
+// ── APU state (module-level, follows cpu_* / ppu_* convention for GraalJS perf) ──
+// Pulse 1
+let apu_p1TimerReload = 0, apu_p1Duty = 0, apu_p1LenCnt = 0, apu_p1LenHalt = false
+let apu_p1EnvStart = false, apu_p1EnvDivider = 0, apu_p1EnvDecay = 0
+let apu_p1EnvConst = false, apu_p1EnvVol = 0, apu_p1Enable = false
+let apu_p1SweepEnable = false, apu_p1SweepPeriod = 0, apu_p1SweepNegate = false
+let apu_p1SweepShift = 0, apu_p1SweepReload = false, apu_p1SweepDivider = 0
+// Pulse 2
+let apu_p2TimerReload = 0, apu_p2Duty = 0, apu_p2LenCnt = 0, apu_p2LenHalt = false
+let apu_p2EnvStart = false, apu_p2EnvDivider = 0, apu_p2EnvDecay = 0
+let apu_p2EnvConst = false, apu_p2EnvVol = 0, apu_p2Enable = false
+let apu_p2SweepEnable = false, apu_p2SweepPeriod = 0, apu_p2SweepNegate = false
+let apu_p2SweepShift = 0, apu_p2SweepReload = false, apu_p2SweepDivider = 0
+// Triangle
+let apu_triTimerReload = 0, apu_triLenCnt = 0, apu_triLenHalt = false
+let apu_triLinCnt = 0, apu_triLinReloadVal = 0, apu_triLinReload = false, apu_triEnable = false
+// Noise
+let apu_nsTimerIdx = 0, apu_nsMode = false, apu_nsLenCnt = 0, apu_nsLenHalt = false
+let apu_nsEnvStart = false, apu_nsEnvDivider = 0, apu_nsEnvDecay = 0
+let apu_nsEnvConst = false, apu_nsEnvVol = 0, apu_nsEnable = false
+// DMC
+let apu_dmcIrqEn = false, apu_dmcLoop = false, apu_dmcRate = 428
+let apu_dmcTimer = 428, apu_dmcOutput = 0
+let apu_dmcSampleAddr = 0xC000, apu_dmcSampleLen = 1, apu_dmcBytesRem = 0
+let apu_dmcAddrCounter = 0xC000
+let apu_dmcBuffer = 0, apu_dmcBufFilled = false
+let apu_dmcShifter = 0, apu_dmcShiftCnt = 8, apu_dmcSilent = true
+let apu_dmcEnable = false, apu_dmcIrqFlag = false
+// Frame counter
+let apu_fcMode = 0, apu_fcInhibitIrq = false, apu_fcCycles = 0
+let apu_fcResetDelay = 0, apu_fcIrqFlag = false
+// Audio output bookkeeping
+let apu_sampleAcc = 0.0        // fractional accumulator for 32 kHz downsampling
+let apu_dmcBuf = new Uint8Array(1200)   // 600 stereo u8 samples per frame (headroom)
+let apu_dmcWritePos = 0         // stereo sample index written into apu_dmcBuf this frame
+let apu_frameCyclesStart = 0    // cpu_totalCycles at frame start
+// Per-frame quarter-frame snapshots for LibPSG sliced mixing (up to 5 slots: initial + 4 QF)
+const APU_MAX_SLICES = 5
+let apu_sliceCount = 1
+let apu_sliceOff  = new Float64Array(APU_MAX_SLICES)
+let apu_snapP1On   = new Uint8Array(APU_MAX_SLICES)
+let apu_snapP1Freq = new Float64Array(APU_MAX_SLICES)
+let apu_snapP1Amp  = new Float64Array(APU_MAX_SLICES)
+let apu_snapP1Duty = new Float64Array(APU_MAX_SLICES)
+let apu_snapP2On   = new Uint8Array(APU_MAX_SLICES)
+let apu_snapP2Freq = new Float64Array(APU_MAX_SLICES)
+let apu_snapP2Amp  = new Float64Array(APU_MAX_SLICES)
+let apu_snapP2Duty = new Float64Array(APU_MAX_SLICES)
+let apu_snapTriOn  = new Uint8Array(APU_MAX_SLICES)
+let apu_snapTriFreq = new Float64Array(APU_MAX_SLICES)
+let apu_snapNsOn   = new Uint8Array(APU_MAX_SLICES)
+let apu_snapNsFreq = new Float64Array(APU_MAX_SLICES)
+let apu_snapNsAmp  = new Float64Array(APU_MAX_SLICES)
+let apu_snapNsMode = new Uint8Array(APU_MAX_SLICES)
+// LibPSG mix buffer and TSVM native staging pointers (allocated in apuBootAudio)
+let libPsgBuf = null
+let apuPsgStagingPtr = 0, apuDmcStagingPtr = 0
+let apuAudioBooted = false
 
 // CPU / PPU state
 const e = {}
@@ -55,6 +120,33 @@ e.secondaryOAMArr = new Uint8Array(0x20)
 // from readPC / readPCu16 / read / write / renderScanline (≈14k dereferences/frame).
 let ramArr = e.ramArr, romArr = e.romArr, chrArr = e.chrArr
 let vramArr = e.vramArr, palArr = e.palArr, oamArr = e.oamArr
+
+// ── Mapper state (set in reset(), used by mapper read/write handlers) ──
+let mapperId  = 0  // from iNES header byte 6/7
+let subMapper = 0  // from iNES header byte 8 (NES 2.0)
+let battery   = false
+let savPath   = null
+let prgRomArr = e.romArr   // full PRG ROM; initialised in reset()
+let chrRomArr = e.chrArr   // full CHR ROM (or alias to chrArr for CHR RAM)
+let wramArr   = new Uint8Array(0x2000)  // $6000–$7FFF backing (reallocated in reset)
+let prgBanks  = 0  // number of 16 KB PRG banks (from header)
+let chrBanks  = 0  // number of 8 KB CHR banks (0 = CHR RAM)
+
+// ── Nametable mirror slot LUT: ntSlot[i] → which 1 KB page of vramArr (0 or 1) ──
+// Updated by setMirrorMode(). Used in write/readPPU/renderScanline.
+const ntSlot  = new Uint8Array(4)  // index = (vramAddr >> 10) & 3
+
+// ── MMC1 state ──
+let mmc1_shift = 0x10, mmc1_ctrl = 0x0C, mmc1_chr0 = 0, mmc1_chr1 = 0, mmc1_prg = 0
+
+// ── MMC3 state ──
+let mmc3_bankSel = 0, mmc3_bankA = 0, mmc3_bank8C = 0
+let mmc3_chr2K0 = 0, mmc3_chr2K8 = 0
+let mmc3_chr1K0 = 0, mmc3_chr1K4 = 0, mmc3_chr1K8 = 0, mmc3_chr1KC = 0
+let mmc3_irqLatch = 0, mmc3_irqCounter = 0
+let mmc3_irqEnable = false, mmc3_irqReload = false, mmc3_prgRamProt = 0
+let mmc3_irqPending = false  // separate "edge has fired" flag for multi-source IRQ arbitration
+
 // iNES header (16 bytes)
 e.inesHdr = new Uint8Array(16)
 // ── Item 2: framebuffer as JS typed array; GPU flush done at frame-end ──
@@ -119,6 +211,38 @@ const bitRev8 = new Uint8Array(256)
         v = ((v & 0xCC) >>> 2) | ((v & 0x33) << 2)
         v = ((v & 0xAA) >>> 1) | ((v & 0x55) << 1)
         bitRev8[i] = v
+    }
+}
+
+///////////////////////////////////////////////////////////////////////////////
+// ── APU lookup tables ──
+// Length counter LUT — indexed by top 5 bits of $4003/$4007/$400B/$400F writes (same as TriCnes:807)
+const APU_LEN_LUT = new Uint8Array([
+    10,254, 20,  2, 40,  4, 80,  6,160,  8, 60, 10, 14, 12, 26, 14,
+    12, 16, 24, 18, 48, 20, 96, 22,192, 24, 72, 26, 16, 28, 32, 30
+])
+// DMC rate table — CPU-cycle periods, NTSC (same as TriCnes:836)
+const APU_DMC_RATE_LUT = new Uint16Array([
+    428,380,340,320,286,254,226,214,190,160,142,128,106,84,72,54
+])
+// Noise period table — CPU-cycle periods, NTSC
+const APU_NOISE_PERIOD_LUT = new Uint16Array([
+    4,8,16,32,64,96,128,160,202,254,380,508,762,1016,2034,4068
+])
+// Pulse duty fractions for LibPSG makeSquare (12.5%, 25%, 50%, 75%)
+const APU_DUTY_FRAC = [0.125, 0.25, 0.5, 0.75]
+// CPU cycles per 32 kHz sample (NTSC): 1789773 / 32000 ≈ 55.93
+const APU_CYC_PER_SAMPLE = 1789773.0 / 32000.0
+
+///////////////////////////////////////////////////////////////////////////////
+// ── Nametable mirror mode — call whenever mirroring changes ──
+// mode 0 = 1-screen low, 1 = 1-screen high, 2 = vertical, 3 = horizontal
+function setMirrorMode(mode) {
+    switch (mode) {
+        case 0: ntSlot[0]=0; ntSlot[1]=0; ntSlot[2]=0; ntSlot[3]=0; break
+        case 1: ntSlot[0]=1; ntSlot[1]=1; ntSlot[2]=1; ntSlot[3]=1; break
+        case 2: ntSlot[0]=0; ntSlot[1]=1; ntSlot[2]=0; ntSlot[3]=1; break  // vertical
+        case 3: ntSlot[0]=0; ntSlot[1]=0; ntSlot[2]=1; ntSlot[3]=1; break  // horizontal
     }
 }
 
@@ -231,6 +355,256 @@ e.free = () => {
 }
 
 ///////////////////////////////////////////////////////////////////////////////
+// ── Mapper helpers ──
+
+function mapperReadWRAM(offset) {
+    if (mapperId == 1) {
+        // MMC1: WRAM enabled when bit 4 of PRG reg is 0
+        if ((mmc1_prg & 0x10) == 0) return wramArr[offset & 0x1FFF]
+    } else if (mapperId == 4) {
+        // MMC3 / MMC6
+        if (subMapper == 1) {
+            // MMC6: 1 KB at $7000-$73FF (first half) and $7200-$73FF (second half)
+            if ((mmc3_bankSel & 0x20) != 0) {
+                if (offset >= 0x7000 && offset <= 0x71FF) {
+                    if ((mmc3_prgRamProt & 0x20) != 0) return wramArr[offset & 0x3FF]
+                } else if (offset >= 0x7200 && offset <= 0x73FF) {
+                    if ((mmc3_prgRamProt & 0x80) != 0) return wramArr[offset & 0x3FF]
+                }
+            }
+        } else {
+            if ((mmc3_prgRamProt & 0x80) != 0) return wramArr[offset & 0x1FFF]
+        }
+    }
+    return 0
+}
+
+function mapperWriteWRAM(offset, value) {
+    if (mapperId == 1) {
+        if ((mmc1_prg & 0x10) == 0) wramArr[offset & 0x1FFF] = value
+    } else if (mapperId == 4) {
+        if (subMapper == 1) {
+            if ((mmc3_bankSel & 0x20) != 0) {
+                if (offset >= 0x7000 && offset <= 0x71FF) {
+                    if ((mmc3_prgRamProt & 0x10) != 0) wramArr[offset & 0x3FF] = value
+                } else if (offset >= 0x7200 && offset <= 0x73FF) {
+                    if ((mmc3_prgRamProt & 0x40) != 0) wramArr[offset & 0x3FF] = value
+                }
+            }
+        } else {
+            // bit 7 = enable, bit 6 = write-protect (0 = writes allowed)
+            if ((mmc3_prgRamProt & 0xC0) == 0x80) wramArr[offset & 0x1FFF] = value
+        }
+    }
+}
+
+function mapperWrite(offset, value) {
+    switch (mapperId) {
+        case 1: mmc1Write(offset, value); break
+        case 4: mmc3Write(offset, value); break
+        // NROM: no writable registers
+    }
+}
+
+// ── MMC1 (iNES mapper 1) ──
+
+function mmc1Init() {
+    mmc1_shift = 0x10
+    mmc1_ctrl  = 0x0C   // mode 3 (fix last at $C000), 4 KB CHR
+    mmc1_chr0  = 0
+    mmc1_chr1  = 0
+    mmc1_prg   = 0
+    mmc1RebuildPRG()
+    mmc1RebuildCHR()
+}
+
+function mmc1Write(addr, val) {
+    if (addr < 0x8000) return  // not a mapper reg
+    // Bit 7 set: hard reset shift register
+    if (val & 0x80) {
+        mmc1_shift = 0x10
+        mmc1_ctrl |= 0x0C
+        mmc1RebuildPRG()
+        return
+    }
+    // Serial-load bit 0 into shift register; bit 4 acts as done-sentinel
+    let done = (mmc1_shift & 1) == 1
+    mmc1_shift = (mmc1_shift >>> 1) | ((val & 1) << 4)
+    if (!done) return
+    // Completed 5-bit write: dispatch by address range
+    let reg = mmc1_shift
+    mmc1_shift = 0x10
+    switch (addr & 0xE000) {
+        case 0x8000:
+            mmc1_ctrl = reg
+            setMirrorMode(reg & 3)
+            mmc1RebuildPRG()
+            mmc1RebuildCHR()
+            break
+        case 0xA000:
+            mmc1_chr0 = reg
+            mmc1RebuildCHR()
+            break
+        case 0xC000:
+            mmc1_chr1 = reg
+            mmc1RebuildCHR()
+            break
+        case 0xE000:
+            mmc1_prg = reg
+            mmc1RebuildPRG()
+            break
+    }
+}
+
+function mmc1RebuildPRG() {
+    let mode = (mmc1_ctrl >>> 2) & 3
+    let numBanks16 = prgRomArr.length >>> 14  // number of 16 KB banks
+    switch (mode) {
+        case 0: case 1: {
+            // 32 KB switch: ignore low bit of bank number
+            let base = (mmc1_prg & 0x0E) * 0x4000
+            for (let i = 0; i < 0x8000; i++)
+                romArr[i] = prgRomArr[(base + i) % prgRomArr.length]
+            break
+        }
+        case 2:
+            // Fix bank 0 at $8000, switch at $C000
+            for (let i = 0; i < 0x4000; i++) romArr[i] = prgRomArr[i % prgRomArr.length]
+            {   let base = (mmc1_prg & 0x0F) * 0x4000
+                for (let i = 0; i < 0x4000; i++)
+                    romArr[0x4000 + i] = prgRomArr[(base + i) % prgRomArr.length]
+            }
+            break
+        case 3:
+            // Switch at $8000, fix last bank at $C000
+            {   let base = (mmc1_prg & 0x0F) * 0x4000
+                for (let i = 0; i < 0x4000; i++)
+                    romArr[i] = prgRomArr[(base + i) % prgRomArr.length]
+            }
+            {   let last = prgRomArr.length - 0x4000
+                for (let i = 0; i < 0x4000; i++) romArr[0x4000 + i] = prgRomArr[last + i]
+            }
+            break
+    }
+}
+
+function mmc1RebuildCHR() {
+    if (chrBanks == 0) return  // CHR RAM: no banking
+    if ((mmc1_ctrl & 0x10) != 0) {
+        // 4 KB mode: two independent 4 KB banks
+        let base0 = (mmc1_chr0 & 0x1F) * 0x1000
+        let base1 = (mmc1_chr1 & 0x1F) * 0x1000
+        for (let i = 0; i < 0x1000; i++) chrArr[i]        = chrRomArr[(base0 + i) % chrRomArr.length]
+        for (let i = 0; i < 0x1000; i++) chrArr[0x1000 + i] = chrRomArr[(base1 + i) % chrRomArr.length]
+    } else {
+        // 8 KB mode: one bank from chr0 (ignore low bit)
+        let base = (mmc1_chr0 & 0x1E) * 0x1000
+        for (let i = 0; i < 0x2000; i++) chrArr[i] = chrRomArr[(base + i) % chrRomArr.length]
+    }
+}
+
+// ── MMC3 (iNES mapper 4) / MMC6 (submapper 1) ──
+
+function mmc3Init() {
+    mmc3_bankSel = 0; mmc3_bankA = 0; mmc3_bank8C = 0
+    mmc3_chr2K0 = 0; mmc3_chr2K8 = 0
+    mmc3_chr1K0 = 0; mmc3_chr1K4 = 0; mmc3_chr1K8 = 0; mmc3_chr1KC = 0
+    mmc3_irqLatch = 0; mmc3_irqCounter = 0
+    mmc3_irqEnable = false; mmc3_irqReload = false; mmc3_prgRamProt = 0; mmc3_irqPending = false
+    mmc3RebuildPRG()
+    mmc3RebuildCHR()
+}
+
+function mmc3Write(addr, val) {
+    if (addr < 0x8000) return
+    switch (addr & 0xE001) {
+        case 0x8000: mmc3_bankSel = val; mmc3RebuildPRG(); mmc3RebuildCHR(); break
+        case 0x8001:
+            switch (mmc3_bankSel & 7) {
+                case 0: mmc3_chr2K0 = val & 0xFE; mmc3RebuildCHR(); break
+                case 1: mmc3_chr2K8 = val & 0xFE; mmc3RebuildCHR(); break
+                case 2: mmc3_chr1K0 = val; mmc3RebuildCHR(); break
+                case 3: mmc3_chr1K4 = val; mmc3RebuildCHR(); break
+                case 4: mmc3_chr1K8 = val; mmc3RebuildCHR(); break
+                case 5: mmc3_chr1KC = val; mmc3RebuildCHR(); break
+                case 6:
+                    mmc3_bank8C = val & ((prgBanks * 2) - 1)
+                    mmc3RebuildPRG()
+                    break
+                case 7:
+                    mmc3_bankA  = val & ((prgBanks * 2) - 1)
+                    mmc3RebuildPRG()
+                    break
+            }
+            break
+        case 0xA000: setMirrorMode((val & 1) ? 3 : 2); break  // 1 = horiz, 0 = vert
+        case 0xA001: mmc3_prgRamProt = val; break
+        case 0xC000: mmc3_irqLatch = val; break
+        case 0xC001: mmc3_irqCounter = 0xFF; mmc3_irqReload = true; break
+        case 0xE000: mmc3_irqEnable = false; mmc3_irqPending = false;
+                     cpu_irqLevel = apu_fcIrqFlag || apu_dmcIrqFlag; break  // ack MMC3 IRQ
+        case 0xE001: mmc3_irqEnable = true; break
+    }
+}
+
+function mmc3RebuildPRG() {
+    // MMC3 PRG: 4 × 8 KB slots. Bit 6 of bankSel swaps which slot is fixed vs. swappable.
+    let lastBank8K = prgBanks * 2 - 1  // index of last 8 KB bank
+    let fixedAt8   = (mmc3_bankSel & 0x40) != 0  // if true: $8000 fixed, $C000 swappable; else vice versa
+    let sl0 = fixedAt8 ? (lastBank8K - 1) : mmc3_bank8C  // $8000 slot
+    let sl2 = fixedAt8 ? mmc3_bank8C : (lastBank8K - 1)  // $C000 slot
+    mmc3CopyPRGSlot(0,      sl0)
+    mmc3CopyPRGSlot(0x2000, mmc3_bankA)
+    mmc3CopyPRGSlot(0x4000, sl2)
+    mmc3CopyPRGSlot(0x6000, lastBank8K)
+}
+function mmc3CopyPRGSlot(destOff, bankIdx8K) {
+    let src = (bankIdx8K & (prgBanks * 2 - 1)) * 0x2000
+    for (let i = 0; i < 0x2000; i++) romArr[destOff + i] = prgRomArr[src + i]
+}
+
+function mmc3RebuildCHR() {
+    if (chrBanks == 0) return  // CHR RAM: no banking
+    // Bit 7 of bankSel: 0 = 2 KB at $0000/$0800, 1 KB at $1000-$1FFF
+    //                   1 = swap: 1 KB at $0000-$0FFF, 2 KB at $1000/$1800
+    let inv = (mmc3_bankSel & 0x80) != 0
+    if (!inv) {
+        mmc3CopyCHR2K(0,      mmc3_chr2K0)
+        mmc3CopyCHR2K(0x800,  mmc3_chr2K8)
+        mmc3CopyCHR1K(0x1000, mmc3_chr1K0)
+        mmc3CopyCHR1K(0x1400, mmc3_chr1K4)
+        mmc3CopyCHR1K(0x1800, mmc3_chr1K8)
+        mmc3CopyCHR1K(0x1C00, mmc3_chr1KC)
+    } else {
+        mmc3CopyCHR1K(0,      mmc3_chr1K0)
+        mmc3CopyCHR1K(0x400,  mmc3_chr1K4)
+        mmc3CopyCHR1K(0x800,  mmc3_chr1K8)
+        mmc3CopyCHR1K(0xC00,  mmc3_chr1KC)
+        mmc3CopyCHR2K(0x1000, mmc3_chr2K0)
+        mmc3CopyCHR2K(0x1800, mmc3_chr2K8)
+    }
+}
+function mmc3CopyCHR2K(destOff, bankIdx) {
+    let src = (bankIdx & (chrBanks * 8 - 1)) * 0x400
+    for (let i = 0; i < 0x800; i++) chrArr[destOff + i] = chrRomArr[src + i]
+}
+function mmc3CopyCHR1K(destOff, bankIdx) {
+    let src = (bankIdx & (chrBanks * 8 - 1)) * 0x400
+    for (let i = 0; i < 0x400; i++) chrArr[destOff + i] = chrRomArr[src + i]
+}
+
+// Called once per visible + pre-render scanline by stepPPU (per-scanline IRQ approximation)
+function mmc3ClockScanline() {
+    if (mmc3_irqReload || mmc3_irqCounter == 0) {
+        mmc3_irqCounter = mmc3_irqLatch
+        mmc3_irqReload  = false
+    } else {
+        mmc3_irqCounter = (mmc3_irqCounter - 1) & 0xFF
+    }
+    if (mmc3_irqCounter == 0 && mmc3_irqEnable) { cpu_irqLevel = true; mmc3_irqPending = true }
+}
+
+///////////////////////////////////////////////////////////////////////////////
 
 const fullFilePath = _G.shell.resolvePathInput(exec_args[1])
 if (fullFilePath === undefined) {
@@ -269,6 +643,20 @@ function read(offset) {
             default: return 0
         }
     }
+    // APU status register ($4015) — reading also clears frame IRQ flag
+    if (offset == 0x4015) {
+        let s = 0
+        if (apu_p1LenCnt  > 0) s |= 1
+        if (apu_p2LenCnt  > 0) s |= 2
+        if (apu_triLenCnt > 0) s |= 4
+        if (apu_nsLenCnt  > 0) s |= 8
+        if (apu_dmcBytesRem > 0) s |= 16
+        if (apu_fcIrqFlag)  s |= 64
+        if (apu_dmcIrqFlag) s |= 128
+        apu_fcIrqFlag = false  // reading $4015 clears frame IRQ (simplified: no 1-cycle delay)
+        cpu_irqLevel = apu_dmcIrqFlag || mmc3_irqPending
+        return s
+    }
     // Controller 1 ($4016) — NES shift register sends LSB first (A=bit0, B=bit1, ...)
     if (offset == 0x4016) {
         let bit = e.cnt1sr & 1
@@ -283,6 +671,8 @@ function read(offset) {
     }
     // PRG ROM ($8000–$FFFF)
     if (offset >= 0x8000) return romArr[offset - 0x8000]
+    // WRAM / cartridge RAM ($6000–$7FFF)
+    if (offset >= 0x6000) return mapperReadWRAM(offset)
     // Unmapped
     return 0
 }
@@ -355,17 +745,11 @@ function write(offset0, value) {
             case 0x2007: { // PPUDATA
                 let vramAddr = e.vramAddr
                 if (vramAddr < 0x2000) {
-                    // CHR RAM (only if no CHR ROM banks)
-                    if (e.inesHdr[5] == 0) chrArr[vramAddr] = value
+                    // CHR RAM (only when no CHR ROM)
+                    if (chrBanks == 0) chrArr[vramAddr] = value
                 } else if (vramAddr < 0x3F00) {
-                    // Nametable VRAM (with mirroring)
-                    if ((e.inesHdr[6] & 1) == 0) {
-                        // horizontal mirroring
-                        vramArr[(vramAddr & 0x3FF) | ((vramAddr & 0x800) >>> 1)] = value
-                    } else {
-                        // vertical mirroring
-                        vramArr[vramAddr & 0x7FF] = value
-                    }
+                    // Nametable VRAM (mirroring via ntSlot LUT)
+                    vramArr[ntSlot[(vramAddr >>> 10) & 3] * 0x400 + (vramAddr & 0x3FF)] = value
                 } else {
                     // Palette RAM
                     if ((vramAddr & 3) == 0) {
@@ -407,15 +791,147 @@ function write(offset0, value) {
                 cycles += 513  // OAM DMA CPU stall
                 break
             }
+            // ── APU registers ──
+            // Pulse 1
+            case 0x4000:
+                apu_p1Duty    = (value >> 6) & 3
+                apu_p1LenHalt = (value & 0x20) != 0
+                apu_p1EnvConst = (value & 0x10) != 0
+                apu_p1EnvVol  = value & 0x0F
+                break
+            case 0x4001:
+                apu_p1SweepEnable = (value & 0x80) != 0
+                apu_p1SweepPeriod = (value >> 4) & 7
+                apu_p1SweepNegate = (value & 8) != 0
+                apu_p1SweepShift  = value & 7
+                apu_p1SweepReload = true
+                break
+            case 0x4002:
+                apu_p1TimerReload = (apu_p1TimerReload & 0x700) | value
+                break
+            case 0x4003:
+                apu_p1TimerReload = (apu_p1TimerReload & 0xFF) | ((value & 7) << 8)
+                if (apu_p1Enable) apu_p1LenCnt = APU_LEN_LUT[value >> 3]
+                apu_p1EnvStart = true
+                break
+            // Pulse 2
+            case 0x4004:
+                apu_p2Duty    = (value >> 6) & 3
+                apu_p2LenHalt = (value & 0x20) != 0
+                apu_p2EnvConst = (value & 0x10) != 0
+                apu_p2EnvVol  = value & 0x0F
+                break
+            case 0x4005:
+                apu_p2SweepEnable = (value & 0x80) != 0
+                apu_p2SweepPeriod = (value >> 4) & 7
+                apu_p2SweepNegate = (value & 8) != 0
+                apu_p2SweepShift  = value & 7
+                apu_p2SweepReload = true
+                break
+            case 0x4006:
+                apu_p2TimerReload = (apu_p2TimerReload & 0x700) | value
+                break
+            case 0x4007:
+                apu_p2TimerReload = (apu_p2TimerReload & 0xFF) | ((value & 7) << 8)
+                if (apu_p2Enable) apu_p2LenCnt = APU_LEN_LUT[value >> 3]
+                apu_p2EnvStart = true
+                break
+            // Triangle
+            case 0x4008:
+                apu_triLenHalt     = (value & 0x80) != 0
+                apu_triLinReloadVal = value & 0x7F
+                break
+            case 0x400A:
+                apu_triTimerReload = (apu_triTimerReload & 0x700) | value
+                break
+            case 0x400B:
+                apu_triTimerReload = (apu_triTimerReload & 0xFF) | ((value & 7) << 8)
+                if (apu_triEnable) apu_triLenCnt = APU_LEN_LUT[value >> 3]
+                apu_triLinReload = true
+                break
+            // Noise
+            case 0x400C:
+                apu_nsLenHalt  = (value & 0x20) != 0
+                apu_nsEnvConst = (value & 0x10) != 0
+                apu_nsEnvVol   = value & 0x0F
+                break
+            case 0x400E:
+                apu_nsMode    = (value & 0x80) != 0
+                apu_nsTimerIdx = value & 0x0F
+                break
+            case 0x400F:
+                if (apu_nsEnable) apu_nsLenCnt = APU_LEN_LUT[value >> 3]
+                apu_nsEnvStart = true
+                break
+            // DMC
+            case 0x4010:
+                apu_dmcIrqEn = (value & 0x80) != 0
+                apu_dmcLoop  = (value & 0x40) != 0
+                apu_dmcRate  = APU_DMC_RATE_LUT[value & 0x0F]
+                if (!apu_dmcIrqEn) {
+                    apu_dmcIrqFlag = false
+                    cpu_irqLevel = apu_fcIrqFlag || mmc3_irqPending
+                }
+                break
+            case 0x4011:
+                apu_dmcOutput = value & 0x7F
+                break
+            case 0x4012:
+                apu_dmcSampleAddr = 0xC000 | (value << 6)
+                break
+            case 0x4013:
+                apu_dmcSampleLen = (value << 4) | 1
+                break
+            // $4015 — channel enables + DMC control
+            case 0x4015: {
+                let wasEnabled = apu_dmcEnable
+                apu_p1Enable  = (value & 1)  != 0;  if (!apu_p1Enable)  apu_p1LenCnt  = 0
+                apu_p2Enable  = (value & 2)  != 0;  if (!apu_p2Enable)  apu_p2LenCnt  = 0
+                apu_triEnable = (value & 4)  != 0;  if (!apu_triEnable) apu_triLenCnt = 0
+                apu_nsEnable  = (value & 8)  != 0;  if (!apu_nsEnable)  apu_nsLenCnt  = 0
+                apu_dmcEnable = (value & 16) != 0
+                apu_dmcIrqFlag = false
+                cpu_irqLevel = apu_fcIrqFlag || mmc3_irqPending
+                if (apu_dmcEnable && apu_dmcBytesRem == 0) {
+                    // Restart DMC sample
+                    apu_dmcAddrCounter = apu_dmcSampleAddr
+                    apu_dmcBytesRem    = apu_dmcSampleLen
+                    // Schedule buffer fill on the next DMC timer tick (set timer to fire soon)
+                    if (apu_dmcSilent) apu_dmcTimer = Math.min(apu_dmcTimer, 2)
+                } else if (!apu_dmcEnable) {
+                    apu_dmcBytesRem = 0
+                }
+                break
+            }
             case 0x4016: // Controller strobe
                 e.cnt1sr = e.currentButtonStatus
                 e.cnt2sr = 0
                 break
+            // $4017 — frame counter mode + IRQ inhibit
+            case 0x4017: {
+                apu_fcMode       = (value & 0x80) != 0 ? 1 : 0
+                apu_fcInhibitIrq = (value & 0x40) != 0
+                apu_fcResetDelay = 3  // reset counter 3–4 CPU cycles later
+                if (apu_fcInhibitIrq) {
+                    apu_fcIrqFlag = false
+                    cpu_irqLevel = apu_dmcIrqFlag || mmc3_irqPending
+                }
+                // In 5-step mode, immediately fire QF + HF
+                if (apu_fcMode == 1) {
+                    apuClockQF()
+                    apuClockHF()
+                }
+                break
+            }
             default: break
         }
         return
     }
-    // Cartridge space ($4020–$7FFF): SRAM / expansion — ignored for mapper 0
+    // Cartridge PRG ROM / mapper registers ($8000–$FFFF)
+    if (offset >= 0x8000) { mapperWrite(offset, value); return }
+    // WRAM / cartridge RAM ($6000–$7FFF)
+    if (offset >= 0x6000) { mapperWriteWRAM(offset, value); return }
+    // $4020–$5FFF: expansion — unused
 }
 
 // Stack is always $0100–$01FF (always in CPU RAM) — bypass read()/write() dispatch.
@@ -450,25 +966,74 @@ function reset() {
         e.inesHdr[i] = sys.peek(headeredRom + i)
     }
 
-    // Copy PRG ROM, handling 1-bank (16KB, mirrored) and 2-bank (32KB) cases
-    let prgBanks = e.inesHdr[4]
-    let prgSize  = prgBanks * 0x4000
-    for (let i = 0; i < 0x8000; i++) {
-        romArr[i] = sys.peek(headeredRom + 0x10 + (i % prgSize))
+    prgBanks  = e.inesHdr[4]
+    chrBanks  = e.inesHdr[5]
+    mapperId  = (e.inesHdr[7] & 0xF0) | (e.inesHdr[6] >>> 4)
+    subMapper = (e.inesHdr[8] & 0xF0) >>> 4
+    battery   = (e.inesHdr[6] & 2) != 0
+
+    let prgSize = prgBanks * 0x4000
+    let chrSize = chrBanks * 0x2000
+
+    // Load full PRG ROM
+    prgRomArr = new Uint8Array(prgSize)
+    for (let i = 0; i < prgSize; i++) {
+        prgRomArr[i] = sys.peek(headeredRom + 0x10 + i)
     }
 
-    // Copy CHR ROM (if present; if 0 banks, chrArr stays as CHR RAM)
-    let chrBanks = e.inesHdr[5]
+    // Load full CHR ROM, or keep chrArr as CHR RAM
     if (chrBanks > 0) {
+        chrRomArr = new Uint8Array(chrSize)
         let chrOffset = 0x10 + prgSize
-        let chrSize = chrBanks * 0x2000
-        if (chrSize > 0x2000) chrSize = 0x2000
         for (let i = 0; i < chrSize; i++) {
-            chrArr[i] = sys.peek(headeredRom + chrOffset + i)
+            chrRomArr[i] = sys.peek(headeredRom + chrOffset + i)
         }
+    } else {
+        chrArr.fill(0)        // clear CHR RAM
+        chrRomArr = chrArr    // CHR RAM: alias to the 8 KB array
     }
 
     sys.free(headeredRom)
+
+    // WRAM (battery-backed save RAM $6000-$7FFF)
+    wramArr = new Uint8Array(0x2000)
+    if (battery) {
+        let romFull = fullFilePath.full
+        let dotIdx  = romFull.lastIndexOf('.')
+        savPath     = (dotIdx > 2) ? romFull.substring(0, dotIdx) + '.sav' : romFull + '.sav'
+        let savFile = files.open(savPath)
+        if (savFile.exists) {
+            let bytes = savFile.bread()
+            let loadLen = Math.min(bytes.length, 0x2000)
+            for (let i = 0; i < loadLen; i++) wramArr[i] = bytes[i] & 0xFF
+        }
+    } else {
+        savPath = null
+    }
+
+    // Initial nametable mirror from header (mapper may override later)
+    let fourScreen = (e.inesHdr[6] & 8) != 0
+    if (fourScreen) {
+        serial.println('[tvnes] WARNING: 4-screen VRAM not supported, using vertical')
+        setMirrorMode(2)
+    } else {
+        setMirrorMode((e.inesHdr[6] & 1) == 1 ? 2 : 3)  // 1 = vertical, 0 = horizontal
+    }
+
+    // Mapper-specific init: sets register defaults and fills romArr/chrArr shadows
+    switch (mapperId) {
+        case 1: mmc1Init(); break
+        case 4: mmc3Init(); break
+        default:
+            // NROM (mapper 0): mirror PRG into 32 KB shadow
+            for (let i = 0; i < 0x8000; i++) romArr[i] = prgRomArr[i % prgSize]
+            // Fill chrArr with CHR ROM (CHR RAM already zeroed above)
+            if (chrBanks > 0) {
+                let copyLen = Math.min(chrSize, 0x2000)
+                for (let i = 0; i < copyLen; i++) chrArr[i] = chrRomArr[i]
+            }
+            break
+    }
 
     // RESET vector
     cpu_fI = true
@@ -478,6 +1043,7 @@ function reset() {
     cpu_sp = 0xFD
 
     buildSpriteSchedule()  // OAM is all-zero at boot; pre-build so first frame has a valid schedule
+    apuReset()
 
     // ── Item 11: open trace file and emit RESET line ──
     if (config.printTracelog) {
@@ -514,7 +1080,7 @@ let traceFile = null   // set in reset() when config.printTracelog is true
 function printTracelog(opcode) {
     // Recover opcode address: PC has already been incremented past the opcode byte.
     let pc = cpu_pc
-    if (!cpu_doNMI) {
+    if (!cpu_doNMI && !cpu_doIRQ) {
         pc = (pc - 1) & 0xFFFF  // back up to opcode byte address
     }
     if (cpu_doNMI) opcode = 0x100  // NMI pseudo-opcode
@@ -622,6 +1188,267 @@ function printTracelog(opcode) {
 }
 
 ///////////////////////////////////////////////////////////////////////////////
+// ── APU engine ──
+
+function apuReset() {
+    // Zero all APU state (called from reset())
+    apu_p1TimerReload = 0; apu_p1Duty = 0; apu_p1LenCnt = 0; apu_p1LenHalt = false
+    apu_p1EnvStart = false; apu_p1EnvDivider = 0; apu_p1EnvDecay = 0
+    apu_p1EnvConst = false; apu_p1EnvVol = 0; apu_p1Enable = false
+    apu_p1SweepEnable = false; apu_p1SweepPeriod = 0; apu_p1SweepNegate = false
+    apu_p1SweepShift = 0; apu_p1SweepReload = false; apu_p1SweepDivider = 0
+    apu_p2TimerReload = 0; apu_p2Duty = 0; apu_p2LenCnt = 0; apu_p2LenHalt = false
+    apu_p2EnvStart = false; apu_p2EnvDivider = 0; apu_p2EnvDecay = 0
+    apu_p2EnvConst = false; apu_p2EnvVol = 0; apu_p2Enable = false
+    apu_p2SweepEnable = false; apu_p2SweepPeriod = 0; apu_p2SweepNegate = false
+    apu_p2SweepShift = 0; apu_p2SweepReload = false; apu_p2SweepDivider = 0
+    apu_triTimerReload = 0; apu_triLenCnt = 0; apu_triLenHalt = false
+    apu_triLinCnt = 0; apu_triLinReloadVal = 0; apu_triLinReload = false; apu_triEnable = false
+    apu_nsTimerIdx = 0; apu_nsMode = false; apu_nsLenCnt = 0; apu_nsLenHalt = false
+    apu_nsEnvStart = false; apu_nsEnvDivider = 0; apu_nsEnvDecay = 0
+    apu_nsEnvConst = false; apu_nsEnvVol = 0; apu_nsEnable = false
+    apu_dmcIrqEn = false; apu_dmcLoop = false; apu_dmcRate = APU_DMC_RATE_LUT[0]
+    apu_dmcTimer = APU_DMC_RATE_LUT[0]; apu_dmcOutput = 0
+    apu_dmcSampleAddr = 0xC000; apu_dmcSampleLen = 1; apu_dmcBytesRem = 0
+    apu_dmcAddrCounter = 0xC000
+    apu_dmcBuffer = 0; apu_dmcBufFilled = false
+    apu_dmcShifter = 0; apu_dmcShiftCnt = 8; apu_dmcSilent = true
+    apu_dmcEnable = false; apu_dmcIrqFlag = false
+    apu_fcMode = 0; apu_fcInhibitIrq = false; apu_fcCycles = 0
+    apu_fcResetDelay = 0; apu_fcIrqFlag = false
+    apu_sampleAcc = 0.0; apu_dmcWritePos = 0
+    apu_frameCyclesStart = cpu_totalCycles
+    apu_sliceCount = 1
+}
+
+// Compute sweep target period for a pulse channel.
+// isP2: pulse 2 uses true two's complement negate; pulse 1 uses one's complement (-(delta+1)).
+function apuSweepTarget(period, negate, shift, isP2) {
+    let delta = period >> shift
+    if (negate) delta = isP2 ? -delta : -(delta + 1)
+    return period + delta
+}
+
+// Clock all envelope generators and the triangle linear counter (quarter-frame event).
+function apuClockQF() {
+    // Pulse 1 envelope
+    if (apu_p1EnvStart) {
+        apu_p1EnvStart = false; apu_p1EnvDecay = 15; apu_p1EnvDivider = apu_p1EnvVol
+    } else if (apu_p1EnvDivider == 0) {
+        apu_p1EnvDivider = apu_p1EnvVol
+        if (apu_p1EnvDecay > 0) apu_p1EnvDecay--
+        else if (apu_p1LenHalt) apu_p1EnvDecay = 15  // loop
+    } else { apu_p1EnvDivider-- }
+    // Pulse 2 envelope
+    if (apu_p2EnvStart) {
+        apu_p2EnvStart = false; apu_p2EnvDecay = 15; apu_p2EnvDivider = apu_p2EnvVol
+    } else if (apu_p2EnvDivider == 0) {
+        apu_p2EnvDivider = apu_p2EnvVol
+        if (apu_p2EnvDecay > 0) apu_p2EnvDecay--
+        else if (apu_p2LenHalt) apu_p2EnvDecay = 15
+    } else { apu_p2EnvDivider-- }
+    // Noise envelope
+    if (apu_nsEnvStart) {
+        apu_nsEnvStart = false; apu_nsEnvDecay = 15; apu_nsEnvDivider = apu_nsEnvVol
+    } else if (apu_nsEnvDivider == 0) {
+        apu_nsEnvDivider = apu_nsEnvVol
+        if (apu_nsEnvDecay > 0) apu_nsEnvDecay--
+        else if (apu_nsLenHalt) apu_nsEnvDecay = 15
+    } else { apu_nsEnvDivider-- }
+    // Triangle linear counter
+    if (apu_triLinReload) {
+        apu_triLinCnt = apu_triLinReloadVal
+    } else if (apu_triLinCnt > 0) {
+        apu_triLinCnt--
+    }
+    if (!apu_triLenHalt) apu_triLinReload = false  // triLenHalt doubles as linear-counter-control
+}
+
+// Clock length counters and sweep units (half-frame event).
+function apuClockHF() {
+    // Length counters
+    if (!apu_p1LenHalt  && apu_p1LenCnt  > 0) apu_p1LenCnt--
+    if (!apu_p2LenHalt  && apu_p2LenCnt  > 0) apu_p2LenCnt--
+    if (!apu_triLenHalt && apu_triLenCnt > 0) apu_triLenCnt--
+    if (!apu_nsLenHalt  && apu_nsLenCnt  > 0) apu_nsLenCnt--
+    // Pulse 1 sweep
+    {
+        let target = apuSweepTarget(apu_p1TimerReload, apu_p1SweepNegate, apu_p1SweepShift, false)
+        if (apu_p1SweepDivider == 0 && apu_p1SweepEnable && apu_p1SweepShift > 0
+                && apu_p1TimerReload >= 8 && target <= 0x7FF) {
+            apu_p1TimerReload = target
+        }
+        if (apu_p1SweepDivider == 0 || apu_p1SweepReload) {
+            apu_p1SweepDivider = apu_p1SweepPeriod; apu_p1SweepReload = false
+        } else { apu_p1SweepDivider-- }
+    }
+    // Pulse 2 sweep
+    {
+        let target = apuSweepTarget(apu_p2TimerReload, apu_p2SweepNegate, apu_p2SweepShift, true)
+        if (apu_p2SweepDivider == 0 && apu_p2SweepEnable && apu_p2SweepShift > 0
+                && apu_p2TimerReload >= 8 && target <= 0x7FF) {
+            apu_p2TimerReload = target
+        }
+        if (apu_p2SweepDivider == 0 || apu_p2SweepReload) {
+            apu_p2SweepDivider = apu_p2SweepPeriod; apu_p2SweepReload = false
+        } else { apu_p2SweepDivider-- }
+    }
+}
+
+// Take a snapshot of current channel state into a slice slot for emitAudioFrame.
+function apuTakeSnapshot(slot) {
+    // Pulse 1
+    let p1Vol  = apu_p1EnvConst ? apu_p1EnvVol : apu_p1EnvDecay
+    let p1T    = apuSweepTarget(apu_p1TimerReload, apu_p1SweepNegate, apu_p1SweepShift, false)
+    let p1Mute = apu_p1TimerReload < 8 || p1T > 0x7FF
+    apu_snapP1On[slot]   = (apu_p1Enable && apu_p1LenCnt > 0 && !p1Mute) ? 1 : 0
+    apu_snapP1Freq[slot] = apu_p1TimerReload > 0 ? 1789773.0 / (16.0 * (apu_p1TimerReload + 1)) : 0
+    apu_snapP1Amp[slot]  = (p1Vol / 15.0) * 0.13
+    apu_snapP1Duty[slot] = APU_DUTY_FRAC[apu_p1Duty]
+    // Pulse 2
+    let p2Vol  = apu_p2EnvConst ? apu_p2EnvVol : apu_p2EnvDecay
+    let p2T    = apuSweepTarget(apu_p2TimerReload, apu_p2SweepNegate, apu_p2SweepShift, true)
+    let p2Mute = apu_p2TimerReload < 8 || p2T > 0x7FF
+    apu_snapP2On[slot]   = (apu_p2Enable && apu_p2LenCnt > 0 && !p2Mute) ? 1 : 0
+    apu_snapP2Freq[slot] = apu_p2TimerReload > 0 ? 1789773.0 / (16.0 * (apu_p2TimerReload + 1)) : 0
+    apu_snapP2Amp[slot]  = (p2Vol / 15.0) * 0.13
+    apu_snapP2Duty[slot] = APU_DUTY_FRAC[apu_p2Duty]
+    // Triangle (no volume control; gate by linCnt + lenCnt + period >= 2)
+    apu_snapTriOn[slot]   = (apu_triEnable && apu_triLenCnt > 0 && apu_triLinCnt > 0
+                              && apu_triTimerReload >= 2) ? 1 : 0
+    apu_snapTriFreq[slot] = apu_triTimerReload >= 2
+                            ? 1789773.0 / (32.0 * (apu_triTimerReload + 1)) : 0
+    // Noise
+    let nsVol = apu_nsEnvConst ? apu_nsEnvVol : apu_nsEnvDecay
+    apu_snapNsOn[slot]   = (apu_nsEnable && apu_nsLenCnt > 0) ? 1 : 0
+    apu_snapNsFreq[slot] = 1789773.0 / APU_NOISE_PERIOD_LUT[apu_nsTimerIdx]
+    apu_snapNsAmp[slot]  = (nsVol / 15.0) * 0.17
+    apu_snapNsMode[slot] = apu_nsMode ? 2 : 1  // 2 = short LFSR (tonal), 1 = long LFSR (full)
+}
+
+// Called at the start of each NES frame (before run()) to initialise the slice array.
+function apuFrameStart() {
+    apu_frameCyclesStart = cpu_totalCycles
+    apu_sliceOff[0] = 0.0
+    apuTakeSnapshot(0)
+    apu_sliceCount = 1
+}
+
+// Record the current channel state as a new slice snapshot.
+function apuSnapNow() {
+    if (apu_sliceCount < APU_MAX_SLICES) {
+        apu_sliceOff[apu_sliceCount] = (cpu_totalCycles - apu_frameCyclesStart) / 1789773.0
+        apuTakeSnapshot(apu_sliceCount)
+        apu_sliceCount++
+    }
+}
+
+// Step the APU by `cycles` CPU cycles.  Returns any extra CPU stall cycles from DMC DMA.
+function stepAPU(cycles) {
+    let extra = 0
+
+    // ── Frame counter ──
+    if (apu_fcResetDelay > 0) {
+        apu_fcResetDelay -= cycles
+        if (apu_fcResetDelay <= 0) { apu_fcCycles = 0; apu_fcResetDelay = 0 }
+    } else {
+        let prev = apu_fcCycles
+        apu_fcCycles += cycles
+        let fc = apu_fcCycles
+
+        if (apu_fcMode == 0) {
+            // 4-step mode — snapshot AFTER each clock event so length counters reflect HF
+            if (prev < 7457  && fc >= 7457)  { apuClockQF(); apuSnapNow() }
+            if (prev < 14913 && fc >= 14913) { apuClockQF(); apuClockHF(); apuSnapNow() }
+            if (prev < 22371 && fc >= 22371) { apuClockQF(); apuSnapNow() }
+            if (prev < 29829 && fc >= 29829) {
+                if (!apu_fcInhibitIrq) { apu_fcIrqFlag = true; cpu_irqLevel = true }
+            }
+            if (prev < 29830 && fc >= 29830) {
+                apuClockQF(); apuClockHF(); apuSnapNow()
+                if (!apu_fcInhibitIrq) { apu_fcIrqFlag = true; cpu_irqLevel = true }
+                apu_fcCycles -= 29830
+            }
+        } else {
+            // 5-step mode
+            if (prev < 7457  && fc >= 7457)  { apuClockQF(); apuSnapNow() }
+            if (prev < 14913 && fc >= 14913) { apuClockQF(); apuClockHF(); apuSnapNow() }
+            if (prev < 22371 && fc >= 22371) { apuClockQF(); apuSnapNow() }
+            // No event at 29829 in 5-step
+            if (prev < 37281 && fc >= 37281) { apuClockQF(); apuClockHF(); apuSnapNow() }
+            if (fc >= 37282) { apu_fcCycles -= 37282 }
+        }
+    }
+
+    // ── DMC timer and bit-clock ──
+    if (apu_dmcEnable || apu_dmcBytesRem > 0) {
+        apu_dmcTimer -= cycles
+        while (apu_dmcTimer <= 0) {
+            apu_dmcTimer += apu_dmcRate
+
+            if (!apu_dmcSilent) {
+                // Shift one delta bit out of the output register
+                if ((apu_dmcShifter & 1) == 1) {
+                    if (apu_dmcOutput <= 125) apu_dmcOutput += 2
+                } else {
+                    if (apu_dmcOutput >= 2) apu_dmcOutput -= 2
+                }
+                apu_dmcShifter >>= 1
+                apu_dmcShiftCnt--
+                if (apu_dmcShiftCnt == 0) {
+                    apu_dmcShiftCnt = 8
+                    if (apu_dmcBufFilled) {
+                        apu_dmcShifter = apu_dmcBuffer
+                        apu_dmcBufFilled = false
+                        apu_dmcSilent = false
+                    } else {
+                        apu_dmcSilent = true
+                    }
+                }
+            } else if (apu_dmcBufFilled) {
+                // Was silent but buffer got filled — restart
+                apu_dmcShifter = apu_dmcBuffer
+                apu_dmcBufFilled = false
+                apu_dmcSilent = false
+                apu_dmcShiftCnt = 8
+            }
+
+            // Refill buffer via DMA if empty and bytes remain
+            if (!apu_dmcBufFilled && apu_dmcBytesRem > 0) {
+                apu_dmcBuffer    = read(apu_dmcAddrCounter)
+                apu_dmcBufFilled = true
+                apu_dmcAddrCounter = (apu_dmcAddrCounter >= 0xFFFF) ? 0x8000
+                                                                     : (apu_dmcAddrCounter + 1)
+                apu_dmcBytesRem--
+                extra += 4  // flat DMC DMA CPU stall (1–4 cycles; we use 4 conservatively)
+                if (apu_dmcBytesRem == 0) {
+                    if (apu_dmcLoop) {
+                        apu_dmcAddrCounter = apu_dmcSampleAddr
+                        apu_dmcBytesRem    = apu_dmcSampleLen
+                    } else {
+                        if (apu_dmcIrqEn) { apu_dmcIrqFlag = true; cpu_irqLevel = true }
+                    }
+                }
+            }
+        }
+    }
+
+    // ── 32 kHz DMC output sampling into apu_dmcBuf (Playhead 1 feed) ──
+    apu_sampleAcc += cycles
+    while (apu_sampleAcc >= APU_CYC_PER_SAMPLE) {
+        apu_sampleAcc -= APU_CYC_PER_SAMPLE
+        if (apu_dmcWritePos < 600) {
+            let u8 = apu_dmcSilent ? 128 : Math.min(254, apu_dmcOutput * 2)
+            let idx = apu_dmcWritePos * 2
+            apu_dmcBuf[idx] = u8; apu_dmcBuf[idx + 1] = u8
+            apu_dmcWritePos++
+        }
+    }
+
+    return extra
+}
+
+///////////////////////////////////////////////////////////////////////////////
 
 function run() {
     // Keep ppuBudget as a local to avoid repeated property reads/writes.
@@ -640,10 +1467,13 @@ function run() {
         cpu_nmiLevel = ppu_enableNMI && ppu_vblank
         if (!prevNMI && cpu_nmiLevel) cpu_doNMI = true
 
+        // IRQ level detection (MMC3 and future mappers); only raises when I flag is clear
+        if (cpu_irqLevel && !cpu_fI && !cpu_doNMI && !cpu_doIRQ) cpu_doIRQ = true
+
         // Spin-loop fast-forward: when the CPU is stuck at the same PC (JMP-to-self)
-        // and no NMI is pending, skip the remaining PPU budget to the next scanline
+        // and no NMI or IRQ is pending, skip the remaining PPU budget to the next scanline
         // boundary in one shot instead of calling emulateCPU ~113 more times.
-        if (cpu_pc === lastPC && !cpu_doNMI) {
+        if (cpu_pc === lastPC && !cpu_doNMI && !cpu_doIRQ) {
             // dots remaining until end of this scanline
             let remPPU  = 341 - (ppuBudget % 341)
             // convert to CPU cycles (ceiling so we don't under-shoot the boundary)
@@ -652,9 +1482,14 @@ function run() {
             cpu_totalCycles += skipCyc
             prof_cpu_cycles += skipCyc
             prof_cpu_skip   += skipCyc
+            if (config.audioEnable) stepAPU(skipCyc)  // keep APU ticking during spin-loops
         } else {
             lastPC = cpu_pc
             emulateCPU()
+            if (config.audioEnable) {
+                let extra = stepAPU(cycles)
+                if (extra) { cycles += extra; cpu_totalCycles += extra; prof_cpu_cycles += extra }
+            }
             ppuBudget += cycles * 3
         }
 
@@ -790,7 +1625,9 @@ function unpackFlags(val) {
 // ── Items 4, 6, 10: emulateCPU with fast opcode fetch, inlined flags ──
 function emulateCPU() {
     let opcode
-    if (!cpu_doNMI) {
+    if (cpu_doNMI || cpu_doIRQ) {
+        opcode = 0x00  // NMI / IRQ both hijack opcode fetch to BRK vector handler
+    } else {
         // ── Item 10: fast opcode fetch from ROM without going through read() ──
         let pc = cpu_pc
         if (pc >= 0x8000) {
@@ -800,8 +1637,6 @@ function emulateCPU() {
             opcode = read(pc)
             cpu_pc = (pc + 1) & 0xFFFF
         }
-    } else {
-        opcode = 0x00
     }
 
     prof_cpu_instrs++
@@ -814,11 +1649,14 @@ function emulateCPU() {
         // BRK / NMI / IRQ handler
         case 0x00:
             if (cpu_doNMI) prof_cpu_nmi++
-            else incPC()  // skip padding byte
+            else if (!cpu_doIRQ) incPC()  // BRK skips padding byte; NMI/IRQ do not
             pushPC()
-            push(packFlags(true))
-            cpu_pc    = cpu_doNMI ? (read(0xFFFA) | (read(0xFFFB) << 8)) : (read(0xFFFE) | (read(0xFFFF) << 8))
+            push(packFlags(!cpu_doNMI && !cpu_doIRQ))  // B flag set only for real BRK
+            cpu_pc    = cpu_doNMI ? (read(0xFFFA) | (read(0xFFFB) << 8))
+                                  : (read(0xFFFE) | (read(0xFFFF) << 8))
+            cpu_fI    = true    // suppress further IRQs while in handler
             cpu_doNMI = false
+            cpu_doIRQ = false
             cpu_nmiFired++
             cycles  = 7
             break
@@ -1088,14 +1926,8 @@ function readPPU(vramAddr) {
     if (vramAddr < 0x2000) {
         return chrArr[vramAddr]
     } else if (vramAddr < 0x3F00) {
-        // Nametable read (with H/V mirroring)
-        if ((e.inesHdr[6] & 1) == 0) {
-            // horizontal mirroring
-            return vramArr[(vramAddr & 0x3FF) | ((vramAddr & 0x800) >>> 1)]
-        } else {
-            // vertical mirroring
-            return vramArr[vramAddr & 0x7FF]
-        }
+        // Nametable read (mirroring via ntSlot LUT)
+        return vramArr[ntSlot[(vramAddr >>> 10) & 3] * 0x400 + (vramAddr & 0x3FF)]
     } else {
         // Palette RAM
         if ((vramAddr & 3) == 0) return palArr[vramAddr & 0x0F]
@@ -1214,8 +2046,6 @@ function renderScanline(sl) {
     const maskSp8   = e.ppuMask8pxMaskSprites
     const fineX     = e.ppuScrollFineX
     const fbArr     = e.fbArr
-    // Nametable mirroring mode (constant per ROM, hoisted out of readPPU)
-    const hMirror   = (e.inesHdr[6] & 1) == 0  // true = horizontal, false = vertical
     // ── Item 8: frameskip — still compute sprite-0 hit but skip pixel writes ──
     const skip      = ppu_skipRender
     const fbBase    = sl * 256
@@ -1233,17 +2063,13 @@ function renderScanline(sl) {
         let va = e.vramAddr
         const highPT = e.ppuBGPatternTable
         for (let tile = 0; tile < 33; tile++) {
-            // Nametable read — inline readPPU for 0x2000–0x3EFF range
+            // Nametable read — inline readPPU for 0x2000–0x3EFF range (ntSlot LUT)
             const ntAddr = 0x2000 | (va & 0x0FFF)
-            const tileId = hMirror
-                ? vramArr[(ntAddr & 0x3FF) | ((ntAddr & 0x800) >>> 1)]
-                : vramArr[ntAddr & 0x7FF]
+            const tileId = vramArr[ntSlot[(ntAddr >>> 10) & 3] * 0x400 + (ntAddr & 0x3FF)]
 
-            // Attribute read — same mirroring
+            // Attribute read — same ntSlot mirroring
             const atAddr = 0x23C0 | (va & 0x0C00) | ((va >>> 4) & 0x38) | ((va >>> 2) & 0x07)
-            let attr = hMirror
-                ? vramArr[(atAddr & 0x3FF) | ((atAddr & 0x800) >>> 1)]
-                : vramArr[atAddr & 0x7FF]
+            let attr = vramArr[ntSlot[(atAddr >>> 10) & 3] * 0x400 + (atAddr & 0x3FF)]
             if (va & 2)         attr >>>= 2  // right half of attr cell
             if ((va >>> 5) & 2) attr >>>= 4  // bottom half of attr cell
             attr &= 3
@@ -1366,7 +2192,11 @@ function stepPPU() {
                     ppuIncrementScrollY(e.vramAddr)
                     ppuResetScrollX(e.vramAddr)
                 }
+                // MMC3 IRQ: tick once per visible scanline (per-scanline approximation of A12)
+                if (mapperId == 4 && renderOn) mmc3ClockScanline()
             }
+            // MMC3 IRQ: also tick on pre-render scanline
+            if (sl == 261 && mapperId == 4 && renderOn) mmc3ClockScanline()
 
             // Advance to next scanline
             dot = 0
@@ -1475,6 +2305,74 @@ function fbToGPU() {
     }
 }
 
+// ── Audio adapter bootstrap (called once; idempotent if audioEnable is false) ──
+function apuBootAudio() {
+    if (!config.audioEnable || apuAudioBooted) return
+    // Allocate LibPSG mix buffer: 25ms covers one frame (16.64ms) with slack
+    libPsgBuf = psg.makeBuffer(0.025)
+    // Native staging buffers for TSVM audio upload
+    apuPsgStagingPtr = sys.malloc(1200)  // ≥ 600 stereo samples × 2 bytes
+    apuDmcStagingPtr = sys.malloc(1200)
+    // Initialise both playheads
+    for (let ph = 0; ph < 2; ph++) {
+        audio.resetParams(ph)
+        audio.purgeQueue(ph)
+        audio.setPcmMode(ph)
+        audio.setMasterVolume(ph, config.audioVolume)
+        audio.setPcmQueueCapacityIndex(ph, 3)  // capacity index 3 → 12 chunks ≈ 200ms jitter
+        audio.play(ph)
+    }
+    apuAudioBooted = true
+    // Play starts after first upload in emitAudioFrame
+}
+
+// Synthesise one NES frame's worth of audio and push to the TSVM Audio Adapter.
+// Called every frame, OUTSIDE the frameskip gate so audio is never dropped.
+function emitAudioFrame() {
+    if (!config.audioEnable) return
+
+    let frameCycles = cpu_totalCycles - apu_frameCyclesStart
+    let frameSec    = frameCycles / 1789773.0
+    if (frameSec <= 0) return
+
+    let numSlices = apu_sliceCount  // typically 4 (one per QF tick) + initial = up to 5 slots
+
+    // ── Mix PSG channels into libPsgBuf, quarter-frame slice by slice ──
+    for (let s = 0; s < numSlices; s++) {
+        let sliceStart = apu_sliceOff[s]
+        let sliceEnd   = (s + 1 < numSlices) ? apu_sliceOff[s + 1] : frameSec
+        let sliceDur   = sliceEnd - sliceStart
+        if (sliceDur <= 0) continue
+
+        if (apu_snapP1On[s])  psg.makeSquare(libPsgBuf, sliceDur, sliceStart,
+            apu_snapP1Freq[s], apu_snapP1Duty[s], 'add', apu_snapP1Amp[s], 0.0)
+        if (apu_snapP2On[s])  psg.makeSquare(libPsgBuf, sliceDur, sliceStart,
+            apu_snapP2Freq[s], apu_snapP2Duty[s], 'add', apu_snapP2Amp[s], 0.0)
+        if (apu_snapTriOn[s]) psg.makeAliasedTriangleNES(libPsgBuf, sliceDur, sliceStart,
+            apu_snapTriFreq[s], 0.0, 'add', 0.25, 0.0)
+        if (apu_snapNsOn[s])  psg.makeNoise(libPsgBuf, sliceDur, sliceStart,
+            apu_snapNsFreq[s], apu_snapNsMode[s], 'add', apu_snapNsAmp[s], 0.0)
+    }
+
+    // ── Upload PSG buffer → Playhead 0 ──
+    if (audio.getPosition(0) <= 4) {
+        psg.sendBufferFast(libPsgBuf, 0, 0, frameSec, apuPsgStagingPtr)
+    }
+
+    // ── Upload DMC buffer → Playhead 1 ──
+    let dmcBytes = apu_dmcWritePos * 2
+    if (dmcBytes > 0 && audio.getPosition(1) <= 4) {
+        sys.pokeBytes(apuDmcStagingPtr, apu_dmcBuf.subarray(0, dmcBytes), dmcBytes)
+        audio.putPcmDataByPtr(1, apuDmcStagingPtr, dmcBytes, 0)
+        audio.setSampleUploadLength(1, dmcBytes)
+        audio.startSampleUpload(1)
+    }
+
+    // ── Reset for next frame ──
+    psg.clearBuffer(libPsgBuf, 0, frameSec)
+    apu_dmcWritePos = 0
+}
+
 function uploadNESmasterPal() {
     let twoc02 = [0x666F,0x019F,0x10AF,0x409F,0x606F,0x602F,0x600F,0x410F,0x230F,0x040F,0x040F,0x041F,0x035F,0x000F,0x000F,0x000F,0xAAAF,0x04DF,0x32FF,0x71FF,0x90BF,0xB16F,0xA20F,0x840F,0x560F,0x270F,0x080F,0x083F,0x069F,0x000F,0x000F,0x000F,0xFFFF,0x5AFF,0x88FF,0xB6FF,0xD6FF,0xF6CF,0xF76F,0xD92F,0xBA0F,0x8C0F,0x5D2F,0x3D6F,0x3CCF,0x444F,0x000F,0x000F,0xFFFF,0xBEFF,0xCDFF,0xECFF,0xFCFF,0xFCEF,0xFCCF,0xFDAF,0xED9F,0xDE9F,0xCEAF,0xBECF,0xBEEF,0xBBBF,0x000F,0x000F]
     let twoc03 = [0x666F,0x029F,0x00DF,0x64DF,0x906F,0xB06F,0xB20F,0x940F,0x640F,0x240F,0x062F,0x090F,0x044F,0x000F,0x000F,0x000F,0xBBBF,0x06DF,0x04FF,0x90FF,0xB0FF,0xF09F,0xF00F,0xD60F,0x960F,0x290F,0x090F,0x0B6F,0x099F,0x000F,0x000F,0x000F,0xFFFF,0x6BFF,0x99FF,0xD6FF,0xF0FF,0xF6FF,0xF90F,0xFB0F,0xDD0F,0x6D0F,0x0F0F,0x4FDF,0x0FFF,0x000F,0x000F,0x000F,0xFFFF,0xBDFF,0xDBFF,0xFBFF,0xF9FF,0xFBBF,0xFD9F,0xFF4F,0xFF6F,0xBF4F,0x9F6F,0x4FDF,0x9DFF,0x000F,0x000F,0x000F]
@@ -1504,6 +2402,7 @@ for (let px = 0; px < 20; px++) {
 }
 
 reset()
+apuBootAudio()
 
 function updateButtonStatus() {
     let status = 0
@@ -1548,7 +2447,9 @@ while (!appexit && !cpu_halted) {
     frameCounter++
     ppu_skipRender = config.frameskip > 1 && (frameCounter % config.frameskip) != 0
 
+    if (config.audioEnable) apuFrameStart()  // snapshot initial channel state, record frame start cycle
     run()
+    { let _ta = sys.nanoTime(); emitAudioFrame(); prof_apu += sys.nanoTime() - _ta }  // always runs — audio must not be skipped with frameskip
 
     if (!ppu_skipRender) {
         let t2 = sys.nanoTime()
@@ -1560,9 +2461,10 @@ while (!appexit && !cpu_halted) {
         if (prof_frames % PROF_INTERVAL == 0) {
             let wall = sys.nanoTime() - prof_wallStart
             let fps  = (prof_frames * 1e9 / wall + 0.5) | 0
-            let total = prof_cpu + prof_ppu + prof_render
+            let total = prof_cpu + prof_ppu + prof_apu + prof_render
             let pctCPU    = total > 0 ? ((prof_cpu    * 100 / total + 0.5) | 0) : 0
             let pctPPU    = total > 0 ? ((prof_ppu    * 100 / total + 0.5) | 0) : 0
+            let pctAPU    = total > 0 ? ((prof_apu    * 100 / total + 0.5) | 0) : 0
             // let pctRender = total > 0 ? ((prof_render * 100 / total + 0.5) | 0) : 0
             // let msPerFrame = total > 0 ? ((total / prof_frames / 1e6 * 10 + 0.5) | 0) / 10 : 0
             // serial.println(`[prof] ${fps} fps | ${msPerFrame}ms/frame | CPU:${pctCPU}% PPU:${pctPPU}% render:${pctRender}%`)
@@ -1584,6 +2486,8 @@ while (!appexit && !cpu_halted) {
             println(pctCPU+"       ")
             println("PPU")
             println(pctPPU+"       ")
+            println("APU")
+            println(pctAPU+"       ")
             println("SKIP")
             println(pctSkip+"       ")
 
@@ -1611,7 +2515,7 @@ while (!appexit && !cpu_halted) {
             }*/
 
             // reset all CPU sub-counters
-            prof_cpu = 0; prof_ppu = 0; prof_render = 0; prof_frames = 0; prof_cpu_cycles = 0; prof_cpu_skip = 0
+            prof_cpu = 0; prof_ppu = 0; prof_apu = 0; prof_render = 0; prof_frames = 0; prof_cpu_cycles = 0; prof_cpu_skip = 0
             // prof_cpu_instrs = 0; prof_cpu_nmi = 0;
             // prof_opcodeHits.fill(0)
             prof_wallStart = sys.nanoTime()
@@ -1634,6 +2538,33 @@ while (!appexit && !cpu_halted) {
 }
 
 if (traceFile) traceFile.flush()
+
+// ── Audio adapter teardown ──
+if (config.audioEnable && apuAudioBooted) {
+    try {
+        audio.stop(0); audio.stop(1)
+        audio.purgeQueue(0); audio.purgeQueue(1)
+        // libPsgBuf is JS-backed (makeBuffer), GC handles it; free only the native staging
+        sys.free(apuPsgStagingPtr); sys.free(apuDmcStagingPtr)
+    } catch (_) { /* teardown must not abort cleanup */ }
+}
+
+// ── Battery-backed WRAM save (MMC1/3/6) ──
+if (battery && savPath != null) {
+    try {
+        // Only write if wramArr has non-zero content (skip empty saves)
+        let hasData = false
+        for (let i = 0; i < wramArr.length; i++) { if (wramArr[i] != 0) { hasData = true; break } }
+        if (hasData) {
+            let savFile = files.open(savPath)
+            if (savFile.exists) savFile.remove()
+            savFile.mkFile()
+            // bwrite expects an array; pass the wramArr directly
+            let wramSz = (subMapper == 1) ? 0x400 : 0x2000  // MMC6: 1 KB
+            savFile.bwrite(wramArr.subarray(0, wramSz))
+        }
+    } catch (_) { /* failed save must not abort cleanup */ }
+}
 
 con.curs_set(1)
 graphics.clearText()
