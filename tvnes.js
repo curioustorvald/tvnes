@@ -639,37 +639,35 @@ function ines228Init() {
 
 function ines228Write(addr, val) {
     if (addr < 0x8000) return
-    let chr = ((addr & 15) << 2) | (val & 3)
-    let prg = (addr >>> 6) & 0x1F
-    let prgBankSize = (addr >>> 5) & 1
-    let chip = (addr >>> 11) & 3
-    let mirroring = (addr >>> 13) & 1 // 0: vert, 1: horz
+    let chr      = ((addr & 15) << 2) | (val & 3)  // CHR[5:2]=addr[3:0], CHR[1:0]=data[1:0]
+    let prg      = (addr >>> 6) & 0x1F              // PRG page within chip (addr bits 10-6)
+    let prgMode  = (addr >>> 5) & 1                 // 0=split even/odd, 1=mirror same page
+    let chip     = (addr >>> 11) & 3                // PRG chip select (addr bits 12-11)
+    let mirroring = (addr >>> 13) & 1               // 0=vert, 1=horz (addr bit 13)
 
     ines228CopyCHR8K(0, chr)
-    if (prgBankSize == 0) {
-        ines228CopyPRGSlot(0, prg, chip)
+    if (prgMode == 0) {  // split: even page at $8000, odd page at $C000
+        let base = prg & 0x1E
+        ines228CopyPRGSlot(0,      base,     chip)
+        ines228CopyPRGSlot(0x4000, base + 1, chip)
+    } else {             // mirror: same page at both $8000 and $C000
+        ines228CopyPRGSlot(0,      prg, chip)
         ines228CopyPRGSlot(0x4000, prg, chip)
-    }
-    else {
-        prg = prg & 0x1E
-        ines228CopyPRGSlot(0, prg, chip)
-        ines228CopyPRGSlot(0x4000, prg+1, chip)
     }
     setMirrorMode(mirroring + 2)
 }
 
 function ines228CopyCHR8K(destOff, bankIdx) {
-    let src = (bankIdx) * 0x2000
+    let src = bankIdx * 0x2000
     for (let i = 0; i < 0x2000; i++) chrArr[destOff + i] = chrRomArr[src + i]
 }
+
 function ines228CopyPRGSlot(destOff, prg, chip) {
-    let src0 = [0x0, 0x80000, null, 0x100000][chip]
-    // no chip = open bus
-    if (src0 === null) {
+    let chipBase = [0x0, 0x80000, null, 0x100000][chip]
+    if (chipBase === null) {  // chip 2 does not exist → open bus
         for (let i = 0; i < 0x4000; i++) romArr[destOff + i] = dataBus
-    }
-    else {
-        let src = [0x0, 0x80000, null, 0x100000][chip] | (chip * 0x4000)
+    } else {
+        let src = chipBase + prg * 0x4000
         for (let i = 0; i < 0x4000; i++) romArr[destOff + i] = prgRomArr[src + i]
     }
 }
