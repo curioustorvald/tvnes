@@ -313,10 +313,13 @@ const OPCODE_NAMES = [
 ///////////////////////////////////////////////////////////////////////////////
 // ── Item 5: lift e.* helpers to top-level functions ──
 
+let dataBus = 0
+
 function readPC() {
     let pc = cpu_pc
     let v = pc >= 0x8000 ? romArr[pc - 0x8000] : read(pc)
     cpu_pc = (pc + 1) & 0xFFFF
+    dataBus = v
     return v
 }
 
@@ -378,7 +381,7 @@ function mapperReadWRAM(offset) {
             if ((mmc3_prgRamProt & 0x80) != 0) return wramArr[offset & 0x1FFF]
         }
     }
-    return 0
+    return dataBus
 }
 
 function mapperWriteWRAM(offset, value) {
@@ -404,7 +407,8 @@ function mapperWrite(offset, value) {
     switch (mapperId) {
         case 1: mmc1Write(offset, value); break
         case 4: mmc3Write(offset, value); break
-        case 7: axromWrite(offset, value); break
+        case 7: aoromWrite(offset, value); break
+        case 228: ines228Write(offset, value); break
         // NROM: no writable registers
     }
 }
@@ -607,11 +611,69 @@ function mmc3ClockScanline() {
     if (mmc3_irqCounter == 0 && mmc3_irqEnable) { cpu_irqLevel = true; mmc3_irqPending = true }
 }
 
-function axromWrite(addr, val) {
-    if (addr < 0x8000) return
-    let prgBank = val & 7
-    let vramPage = (val >>> 4) & 1
+function aoromInit() {
 
+}
+
+function aoromWrite(addr, val) {
+    if (addr < 0x8000) return
+    aoromRebuildCHR(val)
+}
+
+function aoromRebuildCHR(val) {
+    aoRomCopyPRGSlot(0, val & 7)
+    aoRomCopyCHR1K(0, (val >>> 4) & 1)
+}
+
+function aoRomCopyPRGSlot(destOff, bank) {
+    let src = bank * 0x8000
+    for (let i = 0; i < 0x8000; i++) romArr[destOff + i] = prgRomArr[src + i]
+}
+
+function aoRomCopyCHR1K(destOff, bank) {
+    let src = bank * 0x400
+    for (let i = 0; i < 0x400; i++) chrArr[destOff + i] = chrRomArr[src + i]
+}
+
+function ines228Init() {
+    ines228Write(0x8000, 0)
+}
+
+function ines228Write(addr, val) {
+    if (addr < 0x8000) return
+    let chr = ((addr & 15) << 2) | (val & 3)
+    let prg = (addr >>> 6) & 0x1F
+    let prgBankSize = (addr >>> 5) & 1
+    let chip = (addr >>> 11) & 3
+    let mirroring = (addr >>> 13) & 1 // 0: vert, 1: horz
+
+    ines228CopyCHR8K(0, chr)
+    if (prgBankSize == 0) {
+        ines228CopyPRGSlot(0, prg, chip)
+        ines228CopyPRGSlot(0x4000, prg, chip)
+    }
+    else {
+        prg = prg & 0x1E
+        ines228CopyPRGSlot(0, prg, chip)
+        ines228CopyPRGSlot(0x4000, prg+1, chip)
+    }
+    setMirrorMode(mirroring + 2)
+}
+
+function ines228CopyCHR8K(destOff, bankIdx) {
+    let src = (bankIdx) * 0x2000
+    for (let i = 0; i < 0x2000; i++) chrArr[destOff + i] = chrRomArr[src + i]
+}
+function ines228CopyPRGSlot(destOff, prg, chip) {
+    let src0 = [0x0, 0x80000, null, 0x100000][chip]
+    // no chip = open bus
+    if (src0 === null) {
+        for (let i = 0; i < 0x4000; i++) romArr[destOff + i] = dataBus
+    }
+    else {
+        let src = [0x0, 0x80000, null, 0x100000][chip] | (chip * 0x4000)
+        for (let i = 0; i < 0x4000; i++) romArr[destOff + i] = prgRomArr[src + i]
+    }
 }
 
 ///////////////////////////////////////////////////////////////////////////////
@@ -684,7 +746,7 @@ function read(offset) {
     // WRAM / cartridge RAM ($6000–$7FFF)
     if (offset >= 0x6000) return mapperReadWRAM(offset)
     // Unmapped
-    return 0
+    return dataBus
 }
 
 function readSigned(offset) {
@@ -1034,6 +1096,8 @@ function reset() {
     switch (mapperId) {
         case 1: mmc1Init(); break
         case 4: mmc3Init(); break
+        case 7: aoromInit(); break
+        case 228: ines228Init(); break
         default:
             // NROM (mapper 0): mirror PRG into 32 KB shadow
             for (let i = 0; i < 0x8000; i++) romArr[i] = prgRomArr[i % prgSize]
@@ -2389,7 +2453,7 @@ function emitAudioFrame() {
     audio.putPcmDataByPtr(0, apuSumStagingPtr, dmcBytes, 0)
     audio.setSampleUploadLength(0, dmcBytes)
     audio.startSampleUpload(0)
-    
+
     // ── Reset for next frame ──
     apu_absTimeSec += totalSamples / SR  // integer-aligned so frame boundary is also gapless
     psg.clearBuffer(libPsgBuf, 0, frameSec)
