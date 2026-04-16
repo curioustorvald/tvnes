@@ -149,6 +149,9 @@ let mmc3_irqLatch = 0, mmc3_irqCounter = 0
 let mmc3_irqEnable = false, mmc3_irqReload = false, mmc3_prgRamProt = 0
 let mmc3_irqPending = false  // separate "edge has fired" flag for multi-source IRQ arbitration
 
+// ── AOROM (iNES mapper 7) state ──
+let aorom_bankSel = 0
+
 // iNES header (16 bytes)
 e.inesHdr = new Uint8Array(16)
 // ── Item 2: framebuffer as JS typed array; GPU flush done at frame-end ──
@@ -365,20 +368,20 @@ e.free = () => {
 function mapperReadWRAM(offset) {
     if (mapperId == 1) {
         // MMC1: WRAM enabled when bit 4 of PRG reg is 0
-        if ((mmc1_prg & 0x10) == 0) return wramArr[offset & 0x1FFF]
+        if ((mmc1_prg & 0x10) == 0) return dataBus = wramArr[offset & 0x1FFF]
     } else if (mapperId == 4) {
         // MMC3 / MMC6
         if (subMapper == 1) {
             // MMC6: 1 KB at $7000-$73FF (first half) and $7200-$73FF (second half)
             if ((mmc3_bankSel & 0x20) != 0) {
                 if (offset >= 0x7000 && offset <= 0x71FF) {
-                    if ((mmc3_prgRamProt & 0x20) != 0) return wramArr[offset & 0x3FF]
+                    if ((mmc3_prgRamProt & 0x20) != 0) return dataBus = wramArr[offset & 0x3FF]
                 } else if (offset >= 0x7200 && offset <= 0x73FF) {
-                    if ((mmc3_prgRamProt & 0x80) != 0) return wramArr[offset & 0x3FF]
+                    if ((mmc3_prgRamProt & 0x80) != 0) return dataBus = wramArr[offset & 0x3FF]
                 }
             }
         } else {
-            if ((mmc3_prgRamProt & 0x80) != 0) return wramArr[offset & 0x1FFF]
+            if ((mmc3_prgRamProt & 0x80) != 0) return dataBus = wramArr[offset & 0x1FFF]
         }
     }
     return dataBus
@@ -612,27 +615,22 @@ function mmc3ClockScanline() {
 }
 
 function aoromInit() {
-
+    aorom_bankSel = 0
+    aoRomCopyPRGSlot(0, 0)
+    setMirrorMode(0)  // single-screen NT0
 }
 
 function aoromWrite(addr, val) {
     if (addr < 0x8000) return
-    aoromRebuildCHR(val)
-}
-
-function aoromRebuildCHR(val) {
-    aoRomCopyPRGSlot(0, val & 7)
-    aoRomCopyCHR1K(0, (val >>> 4) & 1)
+    aorom_bankSel = val
+    aoRomCopyPRGSlot(0, val & 7)           // bits 2-0: 32 KB PRG bank select
+    setMirrorMode((val >>> 4) & 1)          // bit 4: 0 = single-screen NT0, 1 = NT1
 }
 
 function aoRomCopyPRGSlot(destOff, bank) {
-    let src = bank * 0x8000
-    for (let i = 0; i < 0x8000; i++) romArr[destOff + i] = prgRomArr[src + i]
-}
-
-function aoRomCopyCHR1K(destOff, bank) {
-    let src = bank * 0x400
-    for (let i = 0; i < 0x400; i++) chrArr[destOff + i] = chrRomArr[src + i]
+    let mask = prgRomArr.length - 1
+    let src  = bank * 0x8000
+    for (let i = 0; i < 0x8000; i++) romArr[destOff + i] = prgRomArr[(src + i) & mask]
 }
 
 function ines228Init() {
@@ -687,19 +685,19 @@ if (fullFilePath === undefined) {
 // ── Item 1: read() uses typed arrays, zero sys.peek in hot path ──
 function read(offset) {
     // CPU RAM ($0000–$1FFF, 2KB mirrored)
-    if (offset < 0x2000) return ramArr[offset & 0x7FF]
+    if (offset < 0x2000) return dataBus = ramArr[offset & 0x7FF]
     // PPU registers ($2000–$3FFF, mirrors of $2000–$2007)
     if (offset < 0x4000) {
         offset &= 0x2007
         switch (offset) {
-            case 0x2002: { // PPUSTATUS
-                let ppuStatus = 0
+            case 0x2002: { // PPUSTATUS — lower 5 bits are open bus
+                let ppuStatus = (dataBus & 0x1F)
                 if (ppu_vblank)            ppuStatus |= 0x80
                 if (e.ppuStatusSprZeroHit)  ppuStatus |= 0x40
                 if (e.ppuStatusOverflow)    ppuStatus |= 0x20
                 ppu_vblank   = false
                 e.writeLatch  = false
-                return ppuStatus
+                return dataBus = ppuStatus
             }
             case 0x2007: { // PPUDATA (buffered read)
                 let temp = e.ppuReadBuffer
@@ -710,9 +708,9 @@ function read(offset) {
                     e.ppuReadBuffer = readPPU(vramAddr)
                 }
                 e.vramAddr = (vramAddr + (e.ppuVramInc32Mode ? 32 : 1)) & 0x3FFF
-                return temp
+                return dataBus = temp
             }
-            default: return 0
+            default: return dataBus  // write-only regs return open bus
         }
     }
     // APU status register ($4015) — reading also clears frame IRQ flag
@@ -727,25 +725,25 @@ function read(offset) {
         if (apu_dmcIrqFlag) s |= 128
         apu_fcIrqFlag = false  // reading $4015 clears frame IRQ (simplified: no 1-cycle delay)
         cpu_irqLevel = apu_dmcIrqFlag || mmc3_irqPending
-        return s
+        return dataBus = s
     }
     // Controller 1 ($4016) — NES shift register sends LSB first (A=bit0, B=bit1, ...)
     if (offset == 0x4016) {
         let bit = e.cnt1sr & 1
         e.cnt1sr = e.cnt1sr >>> 1
-        return bit
+        return dataBus = bit
     }
     // Controller 2 ($4017)
     if (offset == 0x4017) {
         let bit = e.cnt2sr & 1
         e.cnt2sr = e.cnt2sr >>> 1
-        return bit
+        return dataBus = bit
     }
     // PRG ROM ($8000–$FFFF)
-    if (offset >= 0x8000) return romArr[offset - 0x8000]
+    if (offset >= 0x8000) return dataBus = romArr[offset - 0x8000]
     // WRAM / cartridge RAM ($6000–$7FFF)
     if (offset >= 0x6000) return mapperReadWRAM(offset)
-    // Unmapped
+    // Unmapped ($4018–$5FFF)
     return dataBus
 }
 
