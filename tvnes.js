@@ -104,8 +104,8 @@ let apu_snapNsAmp  = new Float64Array(APU_MAX_SLICES)
 let apu_snapNsMode = new Uint8Array(APU_MAX_SLICES)
 // LibPSG mix buffer and TSVM native staging pointers (allocated in apuBootAudio)
 let libPsgBuf = null
-let apuPsgStagingPtr = 0, apuDmcStagingPtr = 0, apuSumStagingPtr = 0
-let apuSumTmpL = 0, apuSumTmpR = 0
+let apuSumStagingPtr = 0
+let apu_sumBuf = null  // JS Uint8Array scratch for PSG+DMC interleave mix
 let apuAudioBooted = false
 
 // CPU / PPU state
@@ -2032,9 +2032,10 @@ function buildSpriteSchedule() {
     const sprH   = e.ppuUse8x16Sprites ? 16 : 8
     sprSchedCount.fill(0, 0, 240)
     for (let i = 0; i < 64; i++) {
-        const y    = oamArr[i * 4]
-        const yEnd = y + sprH
-        for (let sl = y; sl < yEnd; sl++) {
+        const y       = oamArr[i * 4]
+        const slStart = (y + 1) & 0xFF  // NES: sprite Y is 1 less than rendering scanline; 255+1 wraps to 0 (pre-render → scanline 0)
+        for (let j = 0; j < sprH; j++) {
+            const sl = slStart + j
             if (sl >= 240) break
             const cnt = sprSchedCount[sl]
             if (cnt < 8) {
@@ -2076,7 +2077,7 @@ function evalSpritesForScanline(sl) {
         const i     = sprSchedIdx[schedBase + slot]
         const base  = i * 4
         const y     = oamArr[base]
-        const row   = sl - y
+        const row   = (sl - y - 1) & 0xFF  // NES +1 offset; & 0xFF handles Y=255 wrap (sl=0 → row=0)
         const spritePtn = oamArr[base + 1]
         const attrs = oamArr[base + 2]
         const posX  = oamArr[base + 3]
@@ -2384,19 +2385,17 @@ function apuBootAudio() {
     if (!config.audioEnable || apuAudioBooted) return
     // Allocate LibPSG mix buffer: 25ms covers one frame (16.64ms) with slack
     libPsgBuf = psg.makeBuffer(0.025)
-    // Native staging buffers for TSVM audio upload
-    apuPsgStagingPtr = sys.calloc(1200)  // ≥ 600 stereo samples × 2 bytes
-    apuDmcStagingPtr = sys.calloc(1200)
-    apuSumStagingPtr = sys.calloc(1200)
-    // Initialise both playheads
-    for (let ph = 0; ph < 1; ph++) {
-        audio.resetParams(ph)
-        audio.purgeQueue(ph)
-        audio.setPcmMode(ph)
-        audio.setMasterVolume(ph, config.audioVolume)
-        audio.setPcmQueueCapacityIndex(ph, 3)  // capacity index 3 → 12 chunks ≈ 200ms jitter
-        audio.play(ph)
-    }
+    // Native staging buffer for the final interleaved PSG+DMC upload
+    apuSumStagingPtr = sys.calloc(1200)  // ≥ 600 stereo samples × 2 bytes
+    // JS-side scratch for mix; no need to go through sys.malloc/poke for this step
+    apu_sumBuf = new Uint8Array(1200)
+    // Initialise playhead 0 (PSG+DMC are mixed into a single stream here)
+    audio.resetParams(0)
+    audio.purgeQueue(0)
+    audio.setPcmMode(0)
+    audio.setMasterVolume(0, config.audioVolume)
+    audio.setPcmQueueCapacityIndex(0, 3)  // capacity index 3 → 12 chunks ≈ 200ms jitter
+    audio.play(0)
     apuAudioBooted = true
 }
 
@@ -2440,23 +2439,26 @@ function emitAudioFrame() {
             apu_snapNsFreq[s], apu_snapNsMode[s], 'add', apu_snapNsAmp[s], 0.0, apu_absTimeSec)
     }
 
-    // mix PSG and DMC buffers
-    let dmcBytes = apu_dmcWritePos * 2
-    let j
-    for (let i = 0; i < dmcBytes / 2; i++) {
-        j = (i >= totalSamples) ? i - 1 : i
-        apuSumTmpL = (libPsgBuf[0][j] + apu_dmcBuf[2*i+0]) >>> 1
-        apuSumTmpR = (libPsgBuf[1][j] + apu_dmcBuf[2*i+1]) >>> 1
-        sys.poke(apuSumStagingPtr + 2*i + 0, apuSumTmpL)
-        sys.poke(apuSumStagingPtr + 2*i + 1, apuSumTmpR)
+    // ── Mix PSG and DMC buffers into apu_sumBuf, then bulk-copy to hardware ──
+    const nSamples = apu_dmcWritePos  // DMC sample count for this frame
+    const dmcBytes = nSamples * 2
+    const psgL = libPsgBuf[0], psgR = libPsgBuf[1]
+    const dmcBuf = apu_dmcBuf, sumBuf = apu_sumBuf
+    const lastPsgIdx = totalSamples - 1  // clamp index for rare DMC/PSG length mismatch
+    for (let i = 0; i < nSamples; i++) {
+        const j = i < totalSamples ? i : lastPsgIdx
+        sumBuf[2*i]   = (psgL[j] + dmcBuf[2*i])   >>> 1
+        sumBuf[2*i+1] = (psgR[j] + dmcBuf[2*i+1]) >>> 1
     }
+    sys.pokeBytes(apuSumStagingPtr, sumBuf.subarray(0, dmcBytes), dmcBytes)
     audio.putPcmDataByPtr(0, apuSumStagingPtr, dmcBytes, 0)
     audio.setSampleUploadLength(0, dmcBytes)
     audio.startSampleUpload(0)
 
     // ── Reset for next frame ──
     apu_absTimeSec += totalSamples / SR  // integer-aligned so frame boundary is also gapless
-    psg.clearBuffer(libPsgBuf, 0, frameSec)
+    libPsgBuf[0].fill(128, 0, totalSamples)
+    libPsgBuf[1].fill(128, 0, totalSamples)
     apu_dmcWritePos = 0
 }
 
@@ -2629,10 +2631,9 @@ if (traceFile) traceFile.flush()
 // ── Audio adapter teardown ──
 if (config.audioEnable && apuAudioBooted) {
     try {
-        audio.stop(0); audio.stop(1)
-        audio.purgeQueue(0); audio.purgeQueue(1)
-        // libPsgBuf is JS-backed (makeBuffer), GC handles it; free only the native staging
-        sys.free(apuPsgStagingPtr); sys.free(apuDmcStagingPtr); sys.free(apuSumStagingPtr)
+        audio.stop(0); audio.purgeQueue(0)
+        sys.free(apuSumStagingPtr)
+        // libPsgBuf and apu_sumBuf are JS-backed; GC handles them
     } catch (_) { /* teardown must not abort cleanup */ }
 }
 

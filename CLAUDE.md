@@ -77,20 +77,22 @@ All arrays are also exposed as module-level aliases (`let ramArr = e.ramArr` etc
 
 ### APU
 
-All five NES APU channels are implemented. Audio routes to the TSVM Audio Adapter via two playheads:
+All five NES APU channels are implemented. All channels are mixed into a single stream on **playhead 0**:
 
-- **Playhead 0** — PSG channels (Pulse 1, Pulse 2, Triangle, Noise) synthesised by LibPSG (`tvdos/include/psg.mjs`) as stereo u8 PCM at 32 kHz.
-- **Playhead 1** — DMC/DPCM channel: delta-modulation output and `$4011` direct writes sampled at 32 kHz into `apu_dmcBuf`, then bulk-uploaded.
+- **PSG channels** (Pulse 1, Pulse 2, Triangle, Noise) — synthesised by LibPSG (`tvdos/include/psg.mjs`) as stereo u8 PCM at 32 kHz into `libPsgBuf`.
+- **DMC/DPCM channel** — delta-modulation output and `$4011` direct writes sampled per CPU cycle into `apu_dmcBuf`.
+
+Each frame, PSG and DMC samples are averaged sample-by-sample (`(psg + dmc) >>> 1`) into a JS `Uint8Array`, bulk-copied to a staging pointer via `sys.pokeBytes`, then uploaded to playhead 0.
 
 Key functions:
 - `stepAPU(cycles)` — clocks the frame counter (4/5-step sequencer), envelopes, length counters, sweep units, triangle linear counter, DMC bit-clock and DMA. Returns extra CPU stall cycles from DMC DMA fetches.
-- `emitAudioFrame()` — called every frame **outside** the frameskip gate. Iterates stored quarter-frame snapshots, calls LibPSG per slice, uploads both playheads.
+- `emitAudioFrame()` — called every frame **outside** the frameskip gate. Iterates stored quarter-frame snapshots, calls LibPSG per slice, averages PSG+DMC sample-by-sample, and uploads the mixed stream to playhead 0.
 - `apuFrameStart()` — called before `run()` to record the frame's start cycle and take the initial channel snapshot.
 - `apuClockQF()` / `apuClockHF()` — quarter-frame and half-frame clock events (envelopes, linear counter, length counters, sweep).
 
 LibPSG additions (in `psg.mjs`):
 - `makeAliasedTriangleNES` — 32-level NES-accurate triangle DAC (4-bit, 0–15 staircase, symmetric).
-- `sendBufferFast` — L/R interleave via JS `Uint8Array` + one `sys.pokeBytes` per chunk (vs ~2n `sys.poke` calls in `sendBuffer`).
+- `sendBufferFast` — L/R interleave via JS `Uint8Array` + one `sys.pokeBytes` per chunk (vs ~2n `sys.poke` calls in `sendBuffer`). Not used by tvnes directly (inline mix loop is faster), but available for other callers.
 
 ### Main loop
 
@@ -157,7 +159,7 @@ These were added explicitly to raise performance on GraalJS/JVM. Each trades som
 
 14. **APU quarter-frame slicing** — channel state (freq, amp, duty) is snapshotted at each frame-counter QF event (4–5 times/frame = 240 Hz update resolution). `emitAudioFrame` calls LibPSG once per slice rather than per-sample, keeping synthesis outside the CPU hot path. No impact on envelope/length accuracy beyond the per-instruction batching already noted.
 
-15. **APU `sendBufferFast`** — PSG buffer upload uses a lazy JS-side `Uint8Array` for interleaving (one `sys.pokeBytes` per chunk), matching the framebuffer `sys.pokeBytes` pattern. The JS scratch is cached across frames to avoid per-frame GC.
+15. **APU inline mix + `sys.pokeBytes`** — PSG and DMC buffers are averaged sample-by-sample into a pre-allocated JS `Uint8Array` scratch (`apu_sumBuf`), then bulk-copied to a native staging pointer via one `sys.pokeBytes` call (replacing ~1066 per-sample `sys.poke` calls/frame). Both the JS scratch and the staging pointer are allocated once at boot and reused every frame.
 
 16. **Multi-source IRQ arbitration** — `mmc3_irqPending` tracks the MMC3 edge independently so APU IRQ clears (`$4015` read, `$4017` inhibit, `$4010` IRQ-disable) do not accidentally lower an active MMC3 IRQ line, and vice-versa.
 
