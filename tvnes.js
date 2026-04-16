@@ -83,6 +83,7 @@ let apu_sampleAcc = 0.0        // fractional accumulator for 32 kHz downsampling
 let apu_dmcBuf = new Uint8Array(1200)   // 600 stereo u8 samples per frame (headroom)
 let apu_dmcWritePos = 0         // stereo sample index written into apu_dmcBuf this frame
 let apu_frameCyclesStart = 0    // cpu_totalCycles at frame start
+let apu_absTimeSec = 0.0        // cumulative audio seconds emitted; used for cross-frame phase continuity
 // Per-frame quarter-frame snapshots for LibPSG sliced mixing (up to 5 slots: initial + 4 QF)
 const APU_MAX_SLICES = 5
 let apu_sliceCount = 1
@@ -103,7 +104,8 @@ let apu_snapNsAmp  = new Float64Array(APU_MAX_SLICES)
 let apu_snapNsMode = new Uint8Array(APU_MAX_SLICES)
 // LibPSG mix buffer and TSVM native staging pointers (allocated in apuBootAudio)
 let libPsgBuf = null
-let apuPsgStagingPtr = 0, apuDmcStagingPtr = 0
+let apuPsgStagingPtr = 0, apuDmcStagingPtr = 0, apuSumStagingPtr = 0
+let apuSumTmpL = 0, apuSumTmpR = 0
 let apuAudioBooted = false
 
 // CPU / PPU state
@@ -402,6 +404,7 @@ function mapperWrite(offset, value) {
     switch (mapperId) {
         case 1: mmc1Write(offset, value); break
         case 4: mmc3Write(offset, value); break
+        case 7: axromWrite(offset, value); break
         // NROM: no writable registers
     }
 }
@@ -602,6 +605,13 @@ function mmc3ClockScanline() {
         mmc3_irqCounter = (mmc3_irqCounter - 1) & 0xFF
     }
     if (mmc3_irqCounter == 0 && mmc3_irqEnable) { cpu_irqLevel = true; mmc3_irqPending = true }
+}
+
+function axromWrite(addr, val) {
+    if (addr < 0x8000) return
+    let prgBank = val & 7
+    let vramPage = (val >>> 4) & 1
+
 }
 
 ///////////////////////////////////////////////////////////////////////////////
@@ -2311,10 +2321,11 @@ function apuBootAudio() {
     // Allocate LibPSG mix buffer: 25ms covers one frame (16.64ms) with slack
     libPsgBuf = psg.makeBuffer(0.025)
     // Native staging buffers for TSVM audio upload
-    apuPsgStagingPtr = sys.malloc(1200)  // ≥ 600 stereo samples × 2 bytes
-    apuDmcStagingPtr = sys.malloc(1200)
+    apuPsgStagingPtr = sys.calloc(1200)  // ≥ 600 stereo samples × 2 bytes
+    apuDmcStagingPtr = sys.calloc(1200)
+    apuSumStagingPtr = sys.calloc(1200)
     // Initialise both playheads
-    for (let ph = 0; ph < 2; ph++) {
+    for (let ph = 0; ph < 1; ph++) {
         audio.resetParams(ph)
         audio.purgeQueue(ph)
         audio.setPcmMode(ph)
@@ -2323,8 +2334,9 @@ function apuBootAudio() {
         audio.play(ph)
     }
     apuAudioBooted = true
-    // Play starts after first upload in emitAudioFrame
 }
+
+function secToSamples(sec) { return Math.round(psg.HW_SAMPLING_RATE * sec) }
 
 // Synthesise one NES frame's worth of audio and push to the TSVM Audio Adapter.
 // Called every frame, OUTSIDE the frameskip gate so audio is never dropped.
@@ -2338,37 +2350,48 @@ function emitAudioFrame() {
     let numSlices = apu_sliceCount  // typically 4 (one per QF tick) + initial = up to 5 slots
 
     // ── Mix PSG channels into libPsgBuf, quarter-frame slice by slice ──
+    // Slice buffer positions are computed as integer sample counts first, then converted back
+    // to seconds.  This avoids the secToSamples rounding mismatch where
+    // round(A*SR) + round(D*SR) ≠ round((A+D)*SR), which would leave 1-sample gaps (stays at
+    // the cleared 128 value) or overlaps between slices — visible as a notch + phase jump at
+    // each QF event boundary (~133/266/399 samples into the frame).
+    const SR = psg.HW_SAMPLING_RATE
+    const totalSamples = Math.round(frameSec * SR)
     for (let s = 0; s < numSlices; s++) {
-        let sliceStart = apu_sliceOff[s]
-        let sliceEnd   = (s + 1 < numSlices) ? apu_sliceOff[s + 1] : frameSec
-        let sliceDur   = sliceEnd - sliceStart
-        if (sliceDur <= 0) continue
+        const sBufStart = Math.round(apu_sliceOff[s] * SR)
+        const sBufEnd   = (s + 1 < numSlices) ? Math.round(apu_sliceOff[s + 1] * SR) : totalSamples
+        const sBufLen   = sBufEnd - sBufStart
+        if (sBufLen <= 0) continue
+        // Derive seconds from integer positions so secToSamples() round-trips cleanly
+        const sliceStart = sBufStart / SR
+        const sliceDur   = sBufLen   / SR
 
         if (apu_snapP1On[s])  psg.makeSquare(libPsgBuf, sliceDur, sliceStart,
-            apu_snapP1Freq[s], apu_snapP1Duty[s], 'add', apu_snapP1Amp[s], 0.0)
+            apu_snapP1Freq[s], apu_snapP1Duty[s], 'add', apu_snapP1Amp[s], 0.0, apu_absTimeSec)
         if (apu_snapP2On[s])  psg.makeSquare(libPsgBuf, sliceDur, sliceStart,
-            apu_snapP2Freq[s], apu_snapP2Duty[s], 'add', apu_snapP2Amp[s], 0.0)
+            apu_snapP2Freq[s], apu_snapP2Duty[s], 'add', apu_snapP2Amp[s], 0.0, apu_absTimeSec)
         if (apu_snapTriOn[s]) psg.makeAliasedTriangleNES(libPsgBuf, sliceDur, sliceStart,
-            apu_snapTriFreq[s], 0.0, 'add', 0.25, 0.0)
+            apu_snapTriFreq[s], 0.0, 'add', 0.25, 0.0, apu_absTimeSec)
         if (apu_snapNsOn[s])  psg.makeNoise(libPsgBuf, sliceDur, sliceStart,
-            apu_snapNsFreq[s], apu_snapNsMode[s], 'add', apu_snapNsAmp[s], 0.0)
+            apu_snapNsFreq[s], apu_snapNsMode[s], 'add', apu_snapNsAmp[s], 0.0, apu_absTimeSec)
     }
 
-    // ── Upload PSG buffer → Playhead 0 ──
-    if (audio.getPosition(0) <= 4) {
-        psg.sendBufferFast(libPsgBuf, 0, 0, frameSec, apuPsgStagingPtr)
-    }
-
-    // ── Upload DMC buffer → Playhead 1 ──
+    // mix PSG and DMC buffers
     let dmcBytes = apu_dmcWritePos * 2
-    if (dmcBytes > 0 && audio.getPosition(1) <= 4) {
-        sys.pokeBytes(apuDmcStagingPtr, apu_dmcBuf.subarray(0, dmcBytes), dmcBytes)
-        audio.putPcmDataByPtr(1, apuDmcStagingPtr, dmcBytes, 0)
-        audio.setSampleUploadLength(1, dmcBytes)
-        audio.startSampleUpload(1)
+    let j
+    for (let i = 0; i < dmcBytes / 2; i++) {
+        j = (i >= totalSamples) ? i - 1 : i
+        apuSumTmpL = (libPsgBuf[0][j] + apu_dmcBuf[2*i+0]) >>> 1
+        apuSumTmpR = (libPsgBuf[1][j] + apu_dmcBuf[2*i+1]) >>> 1
+        sys.poke(apuSumStagingPtr + 2*i + 0, apuSumTmpL)
+        sys.poke(apuSumStagingPtr + 2*i + 1, apuSumTmpR)
     }
-
+    audio.putPcmDataByPtr(0, apuSumStagingPtr, dmcBytes, 0)
+    audio.setSampleUploadLength(0, dmcBytes)
+    audio.startSampleUpload(0)
+    
     // ── Reset for next frame ──
+    apu_absTimeSec += totalSamples / SR  // integer-aligned so frame boundary is also gapless
     psg.clearBuffer(libPsgBuf, 0, frameSec)
     apu_dmcWritePos = 0
 }
@@ -2545,7 +2568,7 @@ if (config.audioEnable && apuAudioBooted) {
         audio.stop(0); audio.stop(1)
         audio.purgeQueue(0); audio.purgeQueue(1)
         // libPsgBuf is JS-backed (makeBuffer), GC handles it; free only the native staging
-        sys.free(apuPsgStagingPtr); sys.free(apuDmcStagingPtr)
+        sys.free(apuPsgStagingPtr); sys.free(apuDmcStagingPtr); sys.free(apuSumStagingPtr)
     } catch (_) { /* teardown must not abort cleanup */ }
 }
 
