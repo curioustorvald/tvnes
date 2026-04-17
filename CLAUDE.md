@@ -119,7 +119,7 @@ while (!appexit) {
 | APU frame IRQ clear | 1-cycle delay on $4015 read | Immediate (no 1-cycle delay) |
 | APU mixer | NES non-linear (two LUTs) | Linear, hand-tuned per-channel amps (pulse ×0.13, tri ×0.25, noise ×0.17) |
 | DMC DMA stall | 1–4 cycles, alignment-aware | Flat +4 cycles per byte fetch |
-| Mappers | NROM, MMC1, MMC3 | NROM (0), MMC1 (1), MMC3 (4), MMC6 (4+sub1) |
+| Mappers | NROM, MMC1, MMC3 | NROM (0), MMC1 (1), UxROM (2), CNROM (3), MMC3 (4), MMC6 (4+sub1), AOROM (7), VRC6a (24), VRC6b (26), FME-7 (69), iNES 228 |
 | Multi-bank PRG | Yes | Full banking for NROM/MMC1/MMC3 |
 | CHR RAM | Yes | Yes (`inesHdr[5] == 0` check) |
 | Illegal opcodes | Partial | Partial (same set) |

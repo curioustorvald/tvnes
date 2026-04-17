@@ -102,6 +102,28 @@ let apu_snapNsOn   = new Uint8Array(APU_MAX_SLICES)
 let apu_snapNsFreq = new Float64Array(APU_MAX_SLICES)
 let apu_snapNsAmp  = new Float64Array(APU_MAX_SLICES)
 let apu_snapNsMode = new Uint8Array(APU_MAX_SLICES)
+// Sunsoft 5B: three extra square channels (FME-7 onboard audio)
+let apu_snap5bAOn   = new Uint8Array(APU_MAX_SLICES)
+let apu_snap5bAFreq = new Float64Array(APU_MAX_SLICES)
+let apu_snap5bAAmp  = new Float64Array(APU_MAX_SLICES)
+let apu_snap5bBOn   = new Uint8Array(APU_MAX_SLICES)
+let apu_snap5bBFreq = new Float64Array(APU_MAX_SLICES)
+let apu_snap5bBAmp  = new Float64Array(APU_MAX_SLICES)
+let apu_snap5bCOn   = new Uint8Array(APU_MAX_SLICES)
+let apu_snap5bCFreq = new Float64Array(APU_MAX_SLICES)
+let apu_snap5bCAmp  = new Float64Array(APU_MAX_SLICES)
+// VRC6: two pulse channels + one sawtooth (Konami onboard audio)
+let apu_snapVrc6P1On   = new Uint8Array(APU_MAX_SLICES)
+let apu_snapVrc6P1Freq = new Float64Array(APU_MAX_SLICES)
+let apu_snapVrc6P1Amp  = new Float64Array(APU_MAX_SLICES)
+let apu_snapVrc6P1Duty = new Float64Array(APU_MAX_SLICES)
+let apu_snapVrc6P2On   = new Uint8Array(APU_MAX_SLICES)
+let apu_snapVrc6P2Freq = new Float64Array(APU_MAX_SLICES)
+let apu_snapVrc6P2Amp  = new Float64Array(APU_MAX_SLICES)
+let apu_snapVrc6P2Duty = new Float64Array(APU_MAX_SLICES)
+let apu_snapVrc6SawOn   = new Uint8Array(APU_MAX_SLICES)
+let apu_snapVrc6SawFreq = new Float64Array(APU_MAX_SLICES)
+let apu_snapVrc6SawAmp  = new Float64Array(APU_MAX_SLICES)
 // LibPSG mix buffer and TSVM native staging pointers (allocated in apuBootAudio)
 let libPsgBuf = null
 let apuSumStagingPtr = 0
@@ -149,8 +171,46 @@ let mmc3_irqLatch = 0, mmc3_irqCounter = 0
 let mmc3_irqEnable = false, mmc3_irqReload = false, mmc3_prgRamProt = 0
 let mmc3_irqPending = false  // separate "edge has fired" flag for multi-source IRQ arbitration
 
+// ── UxROM (iNES mapper 2) state ──
+let uxrom_bankSel = 0
+
+// ── CNROM (iNES mapper 3) state ──
+let cnrom_chrBank = 0
+
 // ── AOROM (iNES mapper 7) state ──
 let aorom_bankSel = 0
+
+// ── Sunsoft FME-7 (iNES mapper 69) state ──
+let fme7_cmd = 0
+let fme7_chr = new Uint8Array(8)
+let fme7_prg6 = 0, fme7_bank6IsRAM = false, fme7_bank6IsRAMEnabled = false
+let fme7_prg8 = 0, fme7_prgA = 0, fme7_prgC = 0
+let fme7_irqEnable = false, fme7_irqCountEnable = false
+let fme7_irqCounter = 0, fme7_irqPending = false
+
+// ── Sunsoft 5B audio (FME-7 onboard PSG — 3 square channels + simple mixer) ──
+// Register selected via $C000, written via $E000. Registers 0-5 are tone periods
+// (12-bit, two bytes per channel), 7 is mixer enable, 8-A are per-channel volume.
+// Envelope and noise are not synthesised — volume-only for registers 8/9/A.
+let s5b_regSel = 0
+let s5b_regs   = new Uint8Array(16)
+
+// ── Konami VRC6 (iNES mapper 24 = VRC6a, 26 = VRC6b) state ──
+// VRC6b swaps CPU A0/A1 when indexing the four-register groups at $9000/$A000/…/$F000.
+let vrc6_variant = 0        // 0 = VRC6a, 1 = VRC6b
+let vrc6_prg16   = 0        // $8000–$BFFF (16 KB)
+let vrc6_prg8    = 0        // $C000–$DFFF (8 KB)
+let vrc6_chr     = new Uint8Array(8)  // 8 × 1 KB CHR banks
+let vrc6_mirror  = 0        // $B003 bits 3–2
+let vrc6_prgRamEnable = false  // $B003 bit 7
+// IRQ
+let vrc6_irqLatch = 0, vrc6_irqCounter = 0, vrc6_irqPrescaler = 341
+let vrc6_irqEnable = false, vrc6_irqAck = false, vrc6_irqMode = false  // mode: false=scanline, true=cycle
+let vrc6_irqPending = false
+// Audio — 2 pulse + 1 sawtooth
+let vrc6_p1Vol = 0, vrc6_p1Duty = 0, vrc6_p1Mode = false, vrc6_p1Period = 0, vrc6_p1En = false
+let vrc6_p2Vol = 0, vrc6_p2Duty = 0, vrc6_p2Mode = false, vrc6_p2Period = 0, vrc6_p2En = false
+let vrc6_sawRate = 0, vrc6_sawPeriod = 0, vrc6_sawEn = false
 
 // iNES header (16 bytes)
 e.inesHdr = new Uint8Array(16)
@@ -383,6 +443,16 @@ function mapperReadWRAM(offset) {
         } else {
             if ((mmc3_prgRamProt & 0x80) != 0) return dataBus = wramArr[offset & 0x1FFF]
         }
+    } else if (mapperId == 69) {
+        // FME-7: $6000-$7FFF bank is ROM or enabled RAM per register 8
+        if (fme7_bank6IsRAM) {
+            if (fme7_bank6IsRAMEnabled) return dataBus = wramArr[offset & 0x1FFF]
+        } else {
+            let src = (fme7_prg6 * 0x2000 + (offset & 0x1FFF)) % prgRomArr.length
+            return dataBus = prgRomArr[src]
+        }
+    } else if (mapperId == 24 || mapperId == 26) {
+        if (vrc6_prgRamEnable) return dataBus = wramArr[offset & 0x1FFF]
     }
     return dataBus
 }
@@ -403,14 +473,22 @@ function mapperWriteWRAM(offset, value) {
             // bit 7 = enable, bit 6 = write-protect (0 = writes allowed)
             if ((mmc3_prgRamProt & 0xC0) == 0x80) wramArr[offset & 0x1FFF] = value
         }
+    } else if (mapperId == 69) {
+        if (fme7_bank6IsRAM && fme7_bank6IsRAMEnabled) wramArr[offset & 0x1FFF] = value
+    } else if (mapperId == 24 || mapperId == 26) {
+        if (vrc6_prgRamEnable) wramArr[offset & 0x1FFF] = value
     }
 }
 
 function mapperWrite(offset, value) {
     switch (mapperId) {
         case 1: mmc1Write(offset, value); break
+        case 2: uxromWrite(offset, value); break
+        case 3: cnromWrite(offset, value); break
         case 4: mmc3Write(offset, value); break
         case 7: aoromWrite(offset, value); break
+        case 24: case 26: vrc6Write(offset, value); break
+        case 69: fme7Write(offset, value); break
         case 228: ines228Write(offset, value); break
         // NROM: no writable registers
     }
@@ -552,7 +630,7 @@ function mmc3Write(addr, val) {
         case 0xC000: mmc3_irqLatch = val; break
         case 0xC001: mmc3_irqCounter = 0xFF; mmc3_irqReload = true; break
         case 0xE000: mmc3_irqEnable = false; mmc3_irqPending = false;
-                     cpu_irqLevel = apu_fcIrqFlag || apu_dmcIrqFlag; break  // ack MMC3 IRQ
+                     cpu_irqLevel = apu_fcIrqFlag || apu_dmcIrqFlag || fme7_irqPending || vrc6_irqPending; break  // ack MMC3 IRQ
         case 0xE001: mmc3_irqEnable = true; break
     }
 }
@@ -614,6 +692,55 @@ function mmc3ClockScanline() {
     if (mmc3_irqCounter == 0 && mmc3_irqEnable) { cpu_irqLevel = true; mmc3_irqPending = true }
 }
 
+// ── UxROM (iNES mapper 2) ──
+
+function uxromInit() {
+    uxrom_bankSel = 0
+    uxromCopyPRG()
+    // UxROM boards typically have CHR RAM; if a ROM provides CHR, seed it
+    if (chrBanks > 0) {
+        let copyLen = Math.min(chrRomArr.length, 0x2000)
+        for (let i = 0; i < copyLen; i++) chrArr[i] = chrRomArr[i]
+    }
+}
+
+function uxromWrite(addr, val) {
+    if (addr < 0x8000) return
+    uxrom_bankSel = val & 0x0F
+    uxromCopyPRG()
+}
+
+function uxromCopyPRG() {
+    let numBanks = prgRomArr.length >>> 14  // count of 16 KB banks
+    let bank = uxrom_bankSel % numBanks
+    let base = bank * 0x4000
+    for (let i = 0; i < 0x4000; i++) romArr[i] = prgRomArr[base + i]
+    let last = prgRomArr.length - 0x4000
+    for (let i = 0; i < 0x4000; i++) romArr[0x4000 + i] = prgRomArr[last + i]
+}
+
+// ── CNROM (iNES mapper 3) ──
+
+function cnromInit() {
+    cnrom_chrBank = 0
+    // PRG is fixed (like NROM): mirror into 32 KB shadow
+    for (let i = 0; i < 0x8000; i++) romArr[i] = prgRomArr[i % prgRomArr.length]
+    cnromCopyCHR()
+}
+
+function cnromWrite(addr, val) {
+    if (addr < 0x8000) return
+    cnrom_chrBank = val & 0x3
+    cnromCopyCHR()
+}
+
+function cnromCopyCHR() {
+    if (chrBanks == 0) return  // CHR RAM: no banking
+    let mask = chrRomArr.length - 1
+    let base = cnrom_chrBank * 0x2000
+    for (let i = 0; i < 0x2000; i++) chrArr[i] = chrRomArr[(base + i) & mask]
+}
+
 function aoromInit() {
     aorom_bankSel = 0
     aoRomCopyPRGSlot(0, 0)
@@ -631,6 +758,267 @@ function aoRomCopyPRGSlot(destOff, bank) {
     let mask = prgRomArr.length - 1
     let src  = bank * 0x8000
     for (let i = 0; i < 0x8000; i++) romArr[destOff + i] = prgRomArr[(src + i) & mask]
+}
+
+// ── Sunsoft FME-7 / iNES mapper 69 ──
+
+function fme7Init() {
+    fme7_cmd = 0
+    fme7_chr.fill(0)
+    fme7_prg6 = 0; fme7_bank6IsRAM = false; fme7_bank6IsRAMEnabled = false
+    fme7_prg8 = 0; fme7_prgA = 0; fme7_prgC = 0
+    fme7_irqEnable = false; fme7_irqCountEnable = false
+    fme7_irqCounter = 0; fme7_irqPending = false
+    s5b_regSel = 0; s5b_regs.fill(0)
+    // Reg 7 default: all channels disabled (all 1s in low 6 bits)
+    s5b_regs[7] = 0x3F
+    fme7RebuildPRG()
+    fme7RebuildCHR()
+    setMirrorMode(2)  // default vertical
+}
+
+function fme7Write(addr, val) {
+    if (addr < 0x8000) return
+    let range = addr & 0xE000
+    if (range == 0x8000) {
+        // Command register (which internal register the next $A000 write targets)
+        fme7_cmd = val & 0x0F
+    } else if (range == 0xA000) {
+        // Parameter for the selected register
+        switch (fme7_cmd) {
+            case 0: case 1: case 2: case 3:
+            case 4: case 5: case 6: case 7:
+                fme7_chr[fme7_cmd] = val
+                fme7RebuildCHR()
+                break
+            case 8:
+                fme7_prg6 = val & 0x3F
+                fme7_bank6IsRAM = (val & 0x40) != 0
+                fme7_bank6IsRAMEnabled = (val & 0x80) != 0
+                break
+            case 9:  fme7_prg8 = val & 0x3F; fme7RebuildPRG(); break
+            case 10: fme7_prgA = val & 0x3F; fme7RebuildPRG(); break
+            case 11: fme7_prgC = val & 0x3F; fme7RebuildPRG(); break
+            case 12:
+                // 0=V, 1=H, 2=1ScA (NT0), 3=1ScB (NT1)
+                // setMirrorMode:  0=1ScA, 1=1ScB, 2=V, 3=H
+                switch (val & 3) {
+                    case 0: setMirrorMode(2); break
+                    case 1: setMirrorMode(3); break
+                    case 2: setMirrorMode(0); break
+                    case 3: setMirrorMode(1); break
+                }
+                break
+            case 13:
+                fme7_irqEnable       = (val & 0x01) != 0
+                fme7_irqCountEnable  = (val & 0x80) != 0
+                fme7_irqPending      = false
+                // Re-evaluate global IRQ line from remaining sources
+                cpu_irqLevel = apu_fcIrqFlag || apu_dmcIrqFlag || mmc3_irqPending
+                break
+            case 14: fme7_irqCounter = (fme7_irqCounter & 0xFF00) | val; break
+            case 15: fme7_irqCounter = (fme7_irqCounter & 0x00FF) | (val << 8); break
+        }
+    } else if (range == 0xC000) {
+        // Sunsoft 5B audio: register select
+        s5b_regSel = val & 0x0F
+    } else if (range == 0xE000) {
+        // Sunsoft 5B audio: register data
+        s5b_regs[s5b_regSel] = val
+    }
+}
+
+function fme7RebuildPRG() {
+    // 3 × 8 KB swappable slots at $8000/$A000/$C000, plus fixed last 8 KB at $E000.
+    // $6000-$7FFF is handled on-the-fly in mapperReadWRAM (it can be RAM or ROM).
+    let romLen = prgRomArr.length
+    fme7CopyPRG8K(0,      fme7_prg8)
+    fme7CopyPRG8K(0x2000, fme7_prgA)
+    fme7CopyPRG8K(0x4000, fme7_prgC)
+    // Fixed last 8 KB bank
+    let lastOff = romLen - 0x2000
+    for (let i = 0; i < 0x2000; i++) romArr[0x6000 + i] = prgRomArr[lastOff + i]
+}
+
+function fme7CopyPRG8K(destOff, bank) {
+    let romLen = prgRomArr.length
+    let base   = (bank * 0x2000) % romLen
+    for (let i = 0; i < 0x2000; i++) romArr[destOff + i] = prgRomArr[(base + i) % romLen]
+}
+
+function fme7RebuildCHR() {
+    if (chrBanks == 0) return  // CHR RAM: no banking
+    let chrLen = chrRomArr.length
+    let mask   = chrLen - 1    // chrLen is a power of two for conforming ROMs
+    for (let slot = 0; slot < 8; slot++) {
+        let base = (fme7_chr[slot] * 0x400) & mask
+        let destOff = slot * 0x400
+        for (let i = 0; i < 0x400; i++) chrArr[destOff + i] = chrRomArr[(base + i) & mask]
+    }
+}
+
+// ── Konami VRC6 (iNES mapper 24 / 26) ──
+
+function vrc6Init() {
+    vrc6_prg16 = 0; vrc6_prg8 = 0
+    vrc6_chr.fill(0)
+    vrc6_mirror = 0; vrc6_prgRamEnable = false
+    vrc6_irqLatch = 0; vrc6_irqCounter = 0; vrc6_irqPrescaler = 341
+    vrc6_irqEnable = false; vrc6_irqAck = false; vrc6_irqMode = false
+    vrc6_irqPending = false
+    vrc6_p1Vol = 0; vrc6_p1Duty = 0; vrc6_p1Mode = false; vrc6_p1Period = 0; vrc6_p1En = false
+    vrc6_p2Vol = 0; vrc6_p2Duty = 0; vrc6_p2Mode = false; vrc6_p2Period = 0; vrc6_p2En = false
+    vrc6_sawRate = 0; vrc6_sawPeriod = 0; vrc6_sawEn = false
+    vrc6RebuildPRG()
+    vrc6RebuildCHR()
+    setMirrorMode(2)  // default vertical
+}
+
+function vrc6Write(addr, val) {
+    if (addr < 0x8000) return
+    // VRC6b swaps CPU A0 and A1 when selecting a register inside a $X000 group
+    let reg = addr & 3
+    if (vrc6_variant == 1) reg = ((reg & 1) << 1) | ((reg >>> 1) & 1)
+    switch (addr & 0xF000) {
+        case 0x8000: vrc6_prg16 = val & 0x0F; vrc6RebuildPRG(); break
+        case 0x9000:
+            switch (reg) {
+                case 0: vrc6_p1Vol  = val & 0x0F
+                        vrc6_p1Duty = (val >>> 4) & 7
+                        vrc6_p1Mode = (val & 0x80) != 0
+                        break
+                case 1: vrc6_p1Period = (vrc6_p1Period & 0xF00) | val; break
+                case 2: vrc6_p1Period = (vrc6_p1Period & 0x0FF) | ((val & 0x0F) << 8)
+                        vrc6_p1En = (val & 0x80) != 0
+                        break
+                case 3: /* frequency ctrl (halt + 4/256 mode) — not synthesised */ break
+            }
+            break
+        case 0xA000:
+            switch (reg) {
+                case 0: vrc6_p2Vol  = val & 0x0F
+                        vrc6_p2Duty = (val >>> 4) & 7
+                        vrc6_p2Mode = (val & 0x80) != 0
+                        break
+                case 1: vrc6_p2Period = (vrc6_p2Period & 0xF00) | val; break
+                case 2: vrc6_p2Period = (vrc6_p2Period & 0x0FF) | ((val & 0x0F) << 8)
+                        vrc6_p2En = (val & 0x80) != 0
+                        break
+            }
+            break
+        case 0xB000:
+            switch (reg) {
+                case 0: vrc6_sawRate = val & 0x3F; break
+                case 1: vrc6_sawPeriod = (vrc6_sawPeriod & 0xF00) | val; break
+                case 2: vrc6_sawPeriod = (vrc6_sawPeriod & 0x0FF) | ((val & 0x0F) << 8)
+                        vrc6_sawEn = (val & 0x80) != 0
+                        break
+                case 3:
+                    vrc6_mirror = (val >>> 2) & 3
+                    vrc6_prgRamEnable = (val & 0x80) != 0
+                    vrc6ApplyMirror()
+                    break
+            }
+            break
+        case 0xC000: vrc6_prg8 = val & 0x1F; vrc6RebuildPRG(); break
+        case 0xD000: vrc6_chr[reg] = val; vrc6RebuildCHR(); break
+        case 0xE000: vrc6_chr[4 + reg] = val; vrc6RebuildCHR(); break
+        case 0xF000:
+            switch (reg) {
+                case 0: vrc6_irqLatch = val; break
+                case 1:
+                    vrc6_irqAck    = (val & 1) != 0
+                    vrc6_irqEnable = (val & 2) != 0
+                    vrc6_irqMode   = (val & 4) != 0
+                    if (vrc6_irqEnable) {
+                        vrc6_irqCounter   = vrc6_irqLatch
+                        vrc6_irqPrescaler = 341
+                    }
+                    vrc6_irqPending = false
+                    cpu_irqLevel = apu_fcIrqFlag || apu_dmcIrqFlag || mmc3_irqPending || fme7_irqPending || vrc6_irqPending
+                    break
+                case 2:
+                    vrc6_irqPending = false
+                    vrc6_irqEnable = vrc6_irqAck
+                    cpu_irqLevel = apu_fcIrqFlag || apu_dmcIrqFlag || mmc3_irqPending || fme7_irqPending || vrc6_irqPending
+                    break
+            }
+            break
+    }
+}
+
+function vrc6RebuildPRG() {
+    let romLen = prgRomArr.length
+    // $8000-$BFFF: 16 KB swappable
+    let base1 = (vrc6_prg16 * 0x4000) % romLen
+    for (let i = 0; i < 0x4000; i++) romArr[i] = prgRomArr[(base1 + i) % romLen]
+    // $C000-$DFFF: 8 KB swappable
+    let base2 = (vrc6_prg8 * 0x2000) % romLen
+    for (let i = 0; i < 0x2000; i++) romArr[0x4000 + i] = prgRomArr[(base2 + i) % romLen]
+    // $E000-$FFFF: last 8 KB fixed
+    let lastOff = romLen - 0x2000
+    for (let i = 0; i < 0x2000; i++) romArr[0x6000 + i] = prgRomArr[lastOff + i]
+}
+
+function vrc6RebuildCHR() {
+    if (chrBanks == 0) return  // CHR RAM: no banking
+    let chrLen = chrRomArr.length
+    let mask   = chrLen - 1   // chrLen is a power of two for conforming ROMs
+    for (let slot = 0; slot < 8; slot++) {
+        let base = (vrc6_chr[slot] * 0x400) & mask
+        let destOff = slot * 0x400
+        for (let i = 0; i < 0x400; i++) chrArr[destOff + i] = chrRomArr[(base + i) & mask]
+    }
+}
+
+function vrc6ApplyMirror() {
+    // $B003 bits 3–2: 00=V, 01=H, 10=1ScA (NT0), 11=1ScB (NT1)
+    switch (vrc6_mirror) {
+        case 0: setMirrorMode(2); break
+        case 1: setMirrorMode(3); break
+        case 2: setMirrorMode(0); break
+        case 3: setMirrorMode(1); break
+    }
+}
+
+// Called from run() per-CPU-instruction batch. Ticks the IRQ counter either per
+// CPU cycle (mode 1) or once per 341 PPU dots (mode 0 — scanline mode); when the
+// 8-bit counter wraps past $FF it reloads from latch and asserts IRQ.
+function vrc6ClockIRQ(cycles) {
+    if (!vrc6_irqEnable) return
+    if (vrc6_irqMode) {
+        // Cycle mode: one tick per CPU cycle
+        let cnt = vrc6_irqCounter + cycles
+        if (cnt >= 0x100) {
+            vrc6_irqPending = true; cpu_irqLevel = true
+            cnt = (vrc6_irqLatch + (cnt - 0x100)) & 0xFF
+        }
+        vrc6_irqCounter = cnt
+    } else {
+        // Scanline mode: prescaler counts 341 PPU dots (= cycles * 3 dots/cycle)
+        vrc6_irqPrescaler -= cycles * 3
+        while (vrc6_irqPrescaler <= 0) {
+            vrc6_irqPrescaler += 341
+            if (vrc6_irqCounter == 0xFF) {
+                vrc6_irqCounter = vrc6_irqLatch
+                vrc6_irqPending = true; cpu_irqLevel = true
+            } else {
+                vrc6_irqCounter = (vrc6_irqCounter + 1) & 0xFF
+            }
+        }
+    }
+}
+
+// Called from run() per-CPU-instruction. When the 16-bit counter underflows
+// from $0000 to $FFFF and IRQs are enabled, assert an IRQ.
+function fme7ClockIRQ(cycles) {
+    if (!fme7_irqCountEnable) return
+    let prev = fme7_irqCounter
+    fme7_irqCounter = (prev - cycles) & 0xFFFF
+    if (cycles > prev && fme7_irqEnable) {
+        cpu_irqLevel = true
+        fme7_irqPending = true
+    }
 }
 
 function ines228Init() {
@@ -722,7 +1110,7 @@ function read(offset) {
         if (apu_fcIrqFlag)  s |= 64
         if (apu_dmcIrqFlag) s |= 128
         apu_fcIrqFlag = false  // reading $4015 clears frame IRQ (simplified: no 1-cycle delay)
-        cpu_irqLevel = apu_dmcIrqFlag || mmc3_irqPending
+        cpu_irqLevel = apu_dmcIrqFlag || mmc3_irqPending || fme7_irqPending || vrc6_irqPending
         return dataBus = s
     }
     // Controller 1 ($4016) — NES shift register sends LSB first (A=bit0, B=bit1, ...)
@@ -938,7 +1326,7 @@ function write(offset0, value) {
                 apu_dmcRate  = APU_DMC_RATE_LUT[value & 0x0F]
                 if (!apu_dmcIrqEn) {
                     apu_dmcIrqFlag = false
-                    cpu_irqLevel = apu_fcIrqFlag || mmc3_irqPending
+                    cpu_irqLevel = apu_fcIrqFlag || mmc3_irqPending || fme7_irqPending || vrc6_irqPending
                 }
                 break
             case 0x4011:
@@ -959,7 +1347,7 @@ function write(offset0, value) {
                 apu_nsEnable  = (value & 8)  != 0;  if (!apu_nsEnable)  apu_nsLenCnt  = 0
                 apu_dmcEnable = (value & 16) != 0
                 apu_dmcIrqFlag = false
-                cpu_irqLevel = apu_fcIrqFlag || mmc3_irqPending
+                cpu_irqLevel = apu_fcIrqFlag || mmc3_irqPending || fme7_irqPending || vrc6_irqPending
                 if (apu_dmcEnable && apu_dmcBytesRem == 0) {
                     // Restart DMC sample
                     apu_dmcAddrCounter = apu_dmcSampleAddr
@@ -982,7 +1370,7 @@ function write(offset0, value) {
                 apu_fcResetDelay = 3  // reset counter 3–4 CPU cycles later
                 if (apu_fcInhibitIrq) {
                     apu_fcIrqFlag = false
-                    cpu_irqLevel = apu_dmcIrqFlag || mmc3_irqPending
+                    cpu_irqLevel = apu_dmcIrqFlag || mmc3_irqPending || fme7_irqPending || vrc6_irqPending
                 }
                 // In 5-step mode, immediately fire QF + HF
                 if (apu_fcMode == 1) {
@@ -1091,8 +1479,13 @@ function reset() {
     // Mapper-specific init: sets register defaults and fills romArr/chrArr shadows
     switch (mapperId) {
         case 1: mmc1Init(); break
+        case 2: uxromInit(); break
+        case 3: cnromInit(); break
         case 4: mmc3Init(); break
         case 7: aoromInit(); break
+        case 24: vrc6_variant = 0; vrc6Init(); break
+        case 26: vrc6_variant = 1; vrc6Init(); break
+        case 69: fme7Init(); break
         case 228: ines228Init(); break
         default:
             // NROM (mapper 0): mirror PRG into 32 KB shadow
@@ -1394,6 +1787,54 @@ function apuTakeSnapshot(slot) {
     apu_snapNsFreq[slot] = 1789773.0 / APU_NOISE_PERIOD_LUT[apu_nsTimerIdx]
     apu_snapNsAmp[slot]  = (nsVol / 15.0) * 0.17
     apu_snapNsMode[slot] = apu_nsMode ? 2 : 1  // 2 = short LFSR (tonal), 1 = long LFSR (full)
+    // ── Sunsoft 5B (FME-7 onboard PSG) ──
+    if (mapperId == 69) {
+        let mix = s5b_regs[7]
+        // Channel A
+        let pA = (s5b_regs[0] | ((s5b_regs[1] & 0x0F) << 8)) & 0xFFF
+        let vA = s5b_regs[8] & 0x0F
+        let toneA_en = (mix & 0x01) == 0
+        apu_snap5bAOn[slot]   = (toneA_en && vA > 0 && pA > 0) ? 1 : 0
+        apu_snap5bAFreq[slot] = pA > 0 ? 1789773.0 / (32.0 * pA) : 0
+        apu_snap5bAAmp[slot]  = (vA / 15.0) * 0.10
+        // Channel B
+        let pB = (s5b_regs[2] | ((s5b_regs[3] & 0x0F) << 8)) & 0xFFF
+        let vB = s5b_regs[9] & 0x0F
+        let toneB_en = (mix & 0x02) == 0
+        apu_snap5bBOn[slot]   = (toneB_en && vB > 0 && pB > 0) ? 1 : 0
+        apu_snap5bBFreq[slot] = pB > 0 ? 1789773.0 / (32.0 * pB) : 0
+        apu_snap5bBAmp[slot]  = (vB / 15.0) * 0.10
+        // Channel C
+        let pC = (s5b_regs[4] | ((s5b_regs[5] & 0x0F) << 8)) & 0xFFF
+        let vC = s5b_regs[10] & 0x0F
+        let toneC_en = (mix & 0x04) == 0
+        apu_snap5bCOn[slot]   = (toneC_en && vC > 0 && pC > 0) ? 1 : 0
+        apu_snap5bCFreq[slot] = pC > 0 ? 1789773.0 / (32.0 * pC) : 0
+        apu_snap5bCAmp[slot]  = (vC / 15.0) * 0.10
+    } else {
+        apu_snap5bAOn[slot] = 0; apu_snap5bBOn[slot] = 0; apu_snap5bCOn[slot] = 0
+    }
+    // ── VRC6 (Konami onboard audio) ──
+    if (mapperId == 24 || mapperId == 26) {
+        // Pulse 1
+        apu_snapVrc6P1On[slot]   = (vrc6_p1En && vrc6_p1Vol > 0) ? 1 : 0
+        apu_snapVrc6P1Freq[slot] = 1789773.0 / (16.0 * (vrc6_p1Period + 1))
+        apu_snapVrc6P1Amp[slot]  = (vrc6_p1Vol / 15.0) * 0.10
+        // Duty: (duty+1)/16; mode bit forces 100% on (DC — inaudible as tone)
+        apu_snapVrc6P1Duty[slot] = vrc6_p1Mode ? 1.0 : ((vrc6_p1Duty + 1) / 16.0)
+        // Pulse 2
+        apu_snapVrc6P2On[slot]   = (vrc6_p2En && vrc6_p2Vol > 0) ? 1 : 0
+        apu_snapVrc6P2Freq[slot] = 1789773.0 / (16.0 * (vrc6_p2Period + 1))
+        apu_snapVrc6P2Amp[slot]  = (vrc6_p2Vol / 15.0) * 0.10
+        apu_snapVrc6P2Duty[slot] = vrc6_p2Mode ? 1.0 : ((vrc6_p2Duty + 1) / 16.0)
+        // Sawtooth: one full ramp per 14 internal clocks → freq = CPU / (14*(period+1))
+        // Peak output ≈ (7*rate)>>3; normalise against max peak (7*63>>3 = 55).
+        apu_snapVrc6SawOn[slot]   = (vrc6_sawEn && vrc6_sawRate > 0) ? 1 : 0
+        apu_snapVrc6SawFreq[slot] = 1789773.0 / (14.0 * (vrc6_sawPeriod + 1))
+        apu_snapVrc6SawAmp[slot]  = (vrc6_sawRate / 63.0) * 0.12
+    } else {
+        apu_snapVrc6P1On[slot] = 0; apu_snapVrc6P2On[slot] = 0; apu_snapVrc6SawOn[slot] = 0
+    }
 }
 
 // Called at the start of each NES frame (before run()) to initialise the slice array.
@@ -1508,7 +1949,7 @@ function stepAPU(cycles) {
     while (apu_sampleAcc >= APU_CYC_PER_SAMPLE) {
         apu_sampleAcc -= APU_CYC_PER_SAMPLE
         if (apu_dmcWritePos < 600) {
-            let u8 = apu_dmcSilent ? 128 : Math.min(254, apu_dmcOutput * 2)
+            let u8 = apu_dmcSilent ? 128 : Math.min(254, apu_dmcOutput + 64)
             let idx = apu_dmcWritePos * 2
             apu_dmcBuf[idx] = u8; apu_dmcBuf[idx + 1] = u8
             apu_dmcWritePos++
@@ -1553,6 +1994,8 @@ function run() {
             prof_cpu_cycles += skipCyc
             prof_cpu_skip   += skipCyc
             if (config.audioEnable) stepAPU(skipCyc)  // keep APU ticking during spin-loops
+            if (mapperId == 69) fme7ClockIRQ(skipCyc)
+            else if (mapperId == 24 || mapperId == 26) vrc6ClockIRQ(skipCyc)
         } else {
             lastPC = cpu_pc
             emulateCPU()
@@ -1560,6 +2003,8 @@ function run() {
                 let extra = stepAPU(cycles)
                 if (extra) { cycles += extra; cpu_totalCycles += extra; prof_cpu_cycles += extra }
             }
+            if (mapperId == 69) fme7ClockIRQ(cycles)
+            else if (mapperId == 24 || mapperId == 26) vrc6ClockIRQ(cycles)
             ppuBudget += cycles * 3
         }
 
@@ -2433,6 +2878,20 @@ function emitAudioFrame() {
             apu_snapTriFreq[s], 0.0, 'add', 0.25, 0.0, apu_absTimeSec)
         if (apu_snapNsOn[s])  psg.makeNoise(libPsgBuf, sliceDur, sliceStart,
             apu_snapNsFreq[s], apu_snapNsMode[s], 'add', apu_snapNsAmp[s], 0.0, apu_absTimeSec)
+        // Sunsoft 5B PSG (FME-7 onboard) — fixed 50% duty square waves
+        if (apu_snap5bAOn[s]) psg.makeSquare(libPsgBuf, sliceDur, sliceStart,
+            apu_snap5bAFreq[s], 0.5, 'add', apu_snap5bAAmp[s], 0.0, apu_absTimeSec)
+        if (apu_snap5bBOn[s]) psg.makeSquare(libPsgBuf, sliceDur, sliceStart,
+            apu_snap5bBFreq[s], 0.5, 'add', apu_snap5bBAmp[s], 0.0, apu_absTimeSec)
+        if (apu_snap5bCOn[s]) psg.makeSquare(libPsgBuf, sliceDur, sliceStart,
+            apu_snap5bCFreq[s], 0.5, 'add', apu_snap5bCAmp[s], 0.0, apu_absTimeSec)
+        // VRC6: 2 pulse (variable duty) + sawtooth (rising ramp via makeTriangle duty=1.0)
+        if (apu_snapVrc6P1On[s]) psg.makeSquare(libPsgBuf, sliceDur, sliceStart,
+            apu_snapVrc6P1Freq[s], apu_snapVrc6P1Duty[s], 'add', apu_snapVrc6P1Amp[s], 0.0, apu_absTimeSec)
+        if (apu_snapVrc6P2On[s]) psg.makeSquare(libPsgBuf, sliceDur, sliceStart,
+            apu_snapVrc6P2Freq[s], apu_snapVrc6P2Duty[s], 'add', apu_snapVrc6P2Amp[s], 0.0, apu_absTimeSec)
+        if (apu_snapVrc6SawOn[s]) psg.makeAliasedTriangle(libPsgBuf, sliceDur, sliceStart,
+            apu_snapVrc6SawFreq[s], 1.0, 'add', apu_snapVrc6SawAmp[s], 0.0, apu_absTimeSec)
     }
 
     // ── Mix PSG and DMC buffers into apu_sumBuf, then bulk-copy to hardware ──
