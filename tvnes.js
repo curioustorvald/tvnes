@@ -1111,7 +1111,7 @@ function read(offset) {
         if (apu_dmcIrqFlag) s |= 128
         apu_fcIrqFlag = false  // reading $4015 clears frame IRQ (simplified: no 1-cycle delay)
         cpu_irqLevel = apu_dmcIrqFlag || mmc3_irqPending || fme7_irqPending || vrc6_irqPending
-        return dataBus = s
+        return s // Reading from $4015 should not update the databus.
     }
     // Controller 1 ($4016) — NES shift register sends LSB first (A=bit0, B=bit1, ...)
     if (offset == 0x4016) {
@@ -1140,6 +1140,7 @@ function readSigned(offset) {
 
 // ── Item 1: write() uses typed arrays ──
 function write(offset0, value) {
+    dataBus = value
     let offset = offset0 & 0xFFFF
     // CPU RAM ($0000–$1FFF, 2KB mirrored)
     if (offset < 0x2000) { ramArr[offset & 0x7FF] = value; return }
@@ -2426,7 +2427,13 @@ function emulateCPU() {
 
         default:
             serial.println(`Illegal opcode $${opcode.toString(16)} at PC $${((cpu_pc - 1) & 0xFFFF).toString(16)}`)
-            cpu_halted = true
+
+            // Treat illegal opcodes as NOP with arguments
+            //// increment PC by addressing mode
+            //// at least it won't crash AccuracyCoin.nes with it
+            let pc = cpu_pc
+            cpu_pc = (pc + arglen[opcode & 0x1F]) & 0xFFFF
+
             break
     }
 
@@ -2434,6 +2441,8 @@ function emulateCPU() {
     prof_cpu_cycles  += cycles
     cpu_totalCycles  += cycles
 }
+
+const arglen = [1,1,1,1,1,1,1,1,1,1,1,1,2,2,2,2,1,1,0,1,1,1,1,1,0,2,0,2,2,2,2,2]
 
 ///////////////////////////////////////////////////////////////////////////////
 // ── Item 1: readPPU uses typed arrays ──
