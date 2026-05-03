@@ -1786,7 +1786,7 @@ function apuTakeSnapshot(slot) {
     let nsVol = apu_nsEnvConst ? apu_nsEnvVol : apu_nsEnvDecay
     apu_snapNsOn[slot]   = (apu_nsEnable && apu_nsLenCnt > 0) ? 1 : 0
     apu_snapNsFreq[slot] = 1789773.0 / APU_NOISE_PERIOD_LUT[apu_nsTimerIdx]
-    apu_snapNsAmp[slot]  = (nsVol / 15.0) * 0.17
+    apu_snapNsAmp[slot]  = (nsVol / 15.0) * 0.085
     apu_snapNsMode[slot] = apu_nsMode ? 2 : 1  // 2 = short LFSR (tonal), 1 = long LFSR (full)
     // ── Sunsoft 5B (FME-7 onboard PSG) ──
     if (mapperId == 69) {
@@ -2947,12 +2947,13 @@ con.curs_set(0)
 graphics.clearText()
 graphics.setCursorYX(19, 1)
 
-for (let px = 0; px < 20; px++) {
+// mask of left and right edge
+/*for (let px = 0; px < 20; px++) {
     for (let py = 0; py < 224; py++) {
         graphics.plotPixelMode1(px, py, 240, 1)
         graphics.plotPixelMode1(280 - px, py, 240, 1)
     }
-}
+}*/
 
 reset()
 apuBootAudio()
