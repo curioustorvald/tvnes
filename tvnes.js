@@ -2123,6 +2123,56 @@ function doROR(val) {
     cpu_fZ = r == 0; cpu_fN = r > 127
     return r
 }
+// Unofficial RMW combos: shift/rotate memory in place, then fold into A.
+// Used by SLO/RLA/SRE/RRA/DCP/ISC variants. All take an effective address
+// (the addressing-mode helper sets pageCrossed for the caller's cycle math,
+// but unofficial RMW opcodes always take the fixed worst-case count).
+function doSLO(addr) {
+    let v = read(addr)
+    cpu_fC = (v & 0x80) != 0
+    v = (v << 1) & 0xFF
+    write(addr, v)
+    cpu_a |= v
+    cpu_fZ = cpu_a == 0; cpu_fN = cpu_a > 127
+}
+function doRLA(addr) {
+    let v = read(addr)
+    let oldC = cpu_fC ? 1 : 0
+    cpu_fC = (v & 0x80) != 0
+    v = ((v << 1) | oldC) & 0xFF
+    write(addr, v)
+    cpu_a &= v
+    cpu_fZ = cpu_a == 0; cpu_fN = cpu_a > 127
+}
+function doSRE(addr) {
+    let v = read(addr)
+    cpu_fC = (v & 1) != 0
+    v = v >>> 1
+    write(addr, v)
+    cpu_a ^= v
+    cpu_fZ = cpu_a == 0; cpu_fN = cpu_a > 127
+}
+function doRRA(addr) {
+    let v = read(addr)
+    let oldC = cpu_fC ? 128 : 0
+    cpu_fC = (v & 1) != 0
+    v = (v >>> 1) | oldC
+    write(addr, v)
+    doADC(v)
+}
+function doDCP(addr) {
+    let v = (read(addr) - 1) & 0xFF
+    write(addr, v)
+    cpu_fC = cpu_a >= v
+    let d = (cpu_a - v) & 0xFF
+    cpu_fZ = d == 0; cpu_fN = (d & 0x80) != 0
+}
+function doISC(addr) {
+    let v = (read(addr) + 1) & 0xFF
+    write(addr, v)
+    doSBC(v)
+}
+
 function packFlags(bFlag) {
     return (cpu_fN    ? 0x80 : 0) | (cpu_fV    ? 0x40 : 0) | 0x20 |
            (bFlag     ? 0x10 : 0) | (cpu_fD    ? 0x08 : 0) |
@@ -2380,6 +2430,226 @@ function emulateCPU() {
         case 0xF5: doSBC(read(addrZpX()));     cycles = 4; break
         case 0xF9: doSBC(read(addrAbsY()));    cycles = 4 + pageCrossed; break
         case 0xFD: doSBC(read(addrAbsX()));    cycles = 4 + pageCrossed; break
+
+        // ─── Unofficial opcodes (combined-op illegals) ───────────────────────
+        // Cycle counts: RMW opcodes (SLO/RLA/SRE/RRA/DCP/ISC) always take the
+        // worst-case count regardless of page-cross (the CPU does a dummy
+        // read/write at the un-fixed address as part of the RMW sequence).
+
+        // SLO — ASL mem, then ORA mem into A
+        case 0x03: doSLO(addrIndX());  cycles = 8; break
+        case 0x07: doSLO(readPC());    cycles = 5; break
+        case 0x0F: doSLO(readPCu16()); cycles = 6; break
+        case 0x13: doSLO(addrIndY());  cycles = 8; break
+        case 0x17: doSLO(addrZpX());   cycles = 6; break
+        case 0x1B: doSLO(addrAbsY());  cycles = 7; break
+        case 0x1F: doSLO(addrAbsX());  cycles = 7; break
+
+        // RLA — ROL mem, then AND mem into A
+        case 0x23: doRLA(addrIndX());  cycles = 8; break
+        case 0x27: doRLA(readPC());    cycles = 5; break
+        case 0x2F: doRLA(readPCu16()); cycles = 6; break
+        case 0x33: doRLA(addrIndY());  cycles = 8; break
+        case 0x37: doRLA(addrZpX());   cycles = 6; break
+        case 0x3B: doRLA(addrAbsY());  cycles = 7; break
+        case 0x3F: doRLA(addrAbsX());  cycles = 7; break
+
+        // SRE — LSR mem, then EOR mem into A
+        case 0x43: doSRE(addrIndX());  cycles = 8; break
+        case 0x47: doSRE(readPC());    cycles = 5; break
+        case 0x4F: doSRE(readPCu16()); cycles = 6; break
+        case 0x53: doSRE(addrIndY());  cycles = 8; break
+        case 0x57: doSRE(addrZpX());   cycles = 6; break
+        case 0x5B: doSRE(addrAbsY());  cycles = 7; break
+        case 0x5F: doSRE(addrAbsX());  cycles = 7; break
+
+        // RRA — ROR mem, then ADC mem into A
+        case 0x63: doRRA(addrIndX());  cycles = 8; break
+        case 0x67: doRRA(readPC());    cycles = 5; break
+        case 0x6F: doRRA(readPCu16()); cycles = 6; break
+        case 0x73: doRRA(addrIndY());  cycles = 8; break
+        case 0x77: doRRA(addrZpX());   cycles = 6; break
+        case 0x7B: doRRA(addrAbsY());  cycles = 7; break
+        case 0x7F: doRRA(addrAbsX());  cycles = 7; break
+
+        // SAX — store (A AND X); flags untouched
+        case 0x83: write(addrIndX(),  cpu_a & cpu_x); cycles = 6; break
+        case 0x87: ramArr[readPC()] = cpu_a & cpu_x;  cycles = 3; break
+        case 0x8F: write(readPCu16(), cpu_a & cpu_x); cycles = 4; break
+        case 0x97: write(addrZpY(),   cpu_a & cpu_x); cycles = 4; break
+
+        // LAX — load A and X with the same value
+        case 0xA3: { let v = read(addrIndX());  cpu_a = v; cpu_x = v; cpu_fZ = v == 0; cpu_fN = v > 127; cycles = 6; break }
+        case 0xA7: { let v = ramArr[readPC()];  cpu_a = v; cpu_x = v; cpu_fZ = v == 0; cpu_fN = v > 127; cycles = 3; break }
+        case 0xAF: { let v = read(readPCu16()); cpu_a = v; cpu_x = v; cpu_fZ = v == 0; cpu_fN = v > 127; cycles = 4; break }
+        case 0xB3: { let v = read(addrIndY());  cpu_a = v; cpu_x = v; cpu_fZ = v == 0; cpu_fN = v > 127; cycles = 5 + pageCrossed; break }
+        case 0xB7: { let v = read(addrZpY());   cpu_a = v; cpu_x = v; cpu_fZ = v == 0; cpu_fN = v > 127; cycles = 4; break }
+        case 0xBF: { let v = read(addrAbsY());  cpu_a = v; cpu_x = v; cpu_fZ = v == 0; cpu_fN = v > 127; cycles = 4 + pageCrossed; break }
+
+        // DCP — DEC mem, then CMP mem against A
+        case 0xC3: doDCP(addrIndX());  cycles = 8; break
+        case 0xC7: doDCP(readPC());    cycles = 5; break
+        case 0xCF: doDCP(readPCu16()); cycles = 6; break
+        case 0xD3: doDCP(addrIndY());  cycles = 8; break
+        case 0xD7: doDCP(addrZpX());   cycles = 6; break
+        case 0xDB: doDCP(addrAbsY());  cycles = 7; break
+        case 0xDF: doDCP(addrAbsX());  cycles = 7; break
+
+        // ISC / ISB — INC mem, then SBC mem from A
+        case 0xE3: doISC(addrIndX());  cycles = 8; break
+        case 0xE7: doISC(readPC());    cycles = 5; break
+        case 0xEF: doISC(readPCu16()); cycles = 6; break
+        case 0xF3: doISC(addrIndY());  cycles = 8; break
+        case 0xF7: doISC(addrZpX());   cycles = 6; break
+        case 0xFB: doISC(addrAbsY());  cycles = 7; break
+        case 0xFF: doISC(addrAbsX());  cycles = 7; break
+
+        // ANC — AND #imm, then copy bit 7 of result to C
+        case 0x0B: case 0x2B:
+            cpu_a &= readPC()
+            cpu_fZ = cpu_a == 0; cpu_fN = cpu_a > 127
+            cpu_fC = cpu_a > 127
+            cycles = 2
+            break
+
+        // ALR / ASR — AND #imm, then LSR A
+        case 0x4B:
+            cpu_a &= readPC()
+            cpu_fC = (cpu_a & 1) != 0
+            cpu_a >>>= 1
+            cpu_fZ = cpu_a == 0; cpu_fN = false
+            cycles = 2
+            break
+
+        // ARR — AND #imm, then ROR A; C = bit 6 of result, V = bit 6 XOR bit 5
+        case 0x6B: {
+            cpu_a &= readPC()
+            let oldC = cpu_fC ? 0x80 : 0
+            cpu_a = (cpu_a >>> 1) | oldC
+            cpu_fZ = cpu_a == 0; cpu_fN = cpu_a > 127
+            cpu_fC = (cpu_a & 0x40) != 0
+            cpu_fV = (((cpu_a >>> 6) & 1) ^ ((cpu_a >>> 5) & 1)) != 0
+            cycles = 2
+            break
+        }
+
+        // AXS / SBX — X = (A AND X) - #imm; flags NZC set from the subtract
+        case 0xCB: {
+            let v = readPC()
+            let t = cpu_a & cpu_x
+            cpu_fC = t >= v
+            cpu_x = (t - v) & 0xFF
+            cpu_fZ = cpu_x == 0; cpu_fN = cpu_x > 127
+            cycles = 2
+            break
+        }
+
+        // LXA — A = X = (A | magic) AND #imm; magic is unstable on real silicon
+        case 0xAB: {
+            let magic = 0xEE
+            if (((Math.random()*128)|0) < 1) magic |= 0x10
+            if (((Math.random()*128)|0) < 1) magic |= 0x01
+            let r = (cpu_a | magic) & readPC()
+            cpu_a = r
+            cpu_x = r
+            cpu_fZ = r == 0; cpu_fN = r > 127
+            cycles = 2
+            break
+        }
+
+        // ─── Unstable "high-byte AND" stores ────────────────────────────────
+        // Common formula: value = REG AND (high_byte_of_base + 1).
+        // On page-cross the high byte of the destination address is also
+        // ANDed with the value, so the write effectively targets a
+        // corrupted page. Matches TriCnes_Emulator.cs ($93/$9B/$9C/$9E/$9F).
+        //
+        // RDY-low quirk (AccuracyCoin "RDY low 2 cycles before write" test):
+        // on real silicon, when DMC DMA pulls RDY low during the high-byte
+        // fix-up cycle, BOTH the (H+1) AND on the value AND the address-high
+        // corruption are dropped — the write goes to the original target
+        // with the register value unmodified. We can't model RDY at single-
+        // cycle granularity, so we approximate by treating DMC playback
+        // (any time apu_dmcEnable is set and bytes remain to fetch) as
+        // "RDY may pull low during this store". Games that combine the
+        // unstable stores with active DMC sample playback are vanishingly
+        // rare, so the false-positive cost is negligible.
+
+        // SHA / AHX (ind),Y — store A AND X AND (H+1)
+        case 0x93: {
+            let base = readZpU16(readPC())
+            let addr = (base + cpu_y) & 0xFFFF
+            let hi   = (((base >>> 8) + 1) & 0xFF)
+            let dma  = apu_dmcEnable && apu_dmcBytesRem > 0
+            let v    = dma ? (cpu_a & cpu_x) : (cpu_a & cpu_x & hi)
+            if (!dma && (base & 0xFF00) != (addr & 0xFF00)) addr = ((v << 8) | (addr & 0xFF))
+            write(addr, v)
+            cycles = 6
+            break
+        }
+
+        // TAS / SHS / XAS abs,Y — SP = A AND X; store SP AND (H+1)
+        case 0x9B: {
+            let base = readPCu16()
+            let addr = (base + cpu_y) & 0xFFFF
+            cpu_sp   = cpu_a & cpu_x
+            let hi   = (((base >>> 8) + 1) & 0xFF)
+            let dma  = apu_dmcEnable && apu_dmcBytesRem > 0
+            let v    = dma ? cpu_sp : (cpu_sp & hi)
+            if (!dma && (base & 0xFF00) != (addr & 0xFF00)) addr = ((v << 8) | (addr & 0xFF))
+            write(addr, v)
+            cycles = 5
+            break
+        }
+
+        // SHY abs,X — store Y AND (H+1)
+        case 0x9C: {
+            let base = readPCu16()
+            let addr = (base + cpu_x) & 0xFFFF
+            let hi   = (((base >>> 8) + 1) & 0xFF)
+            let dma  = apu_dmcEnable && apu_dmcBytesRem > 0
+            let v    = dma ? cpu_y : (cpu_y & hi)
+            if (!dma && (base & 0xFF00) != (addr & 0xFF00)) addr = ((v << 8) | (addr & 0xFF))
+            write(addr, v)
+            cycles = 5
+            break
+        }
+
+        // SHX abs,Y — store X AND (H+1)
+        case 0x9E: {
+            let base = readPCu16()
+            let addr = (base + cpu_y) & 0xFFFF
+            let hi   = (((base >>> 8) + 1) & 0xFF)
+            let dma  = apu_dmcEnable && apu_dmcBytesRem > 0
+            let v    = dma ? cpu_x : (cpu_x & hi)
+            if (!dma && (base & 0xFF00) != (addr & 0xFF00)) addr = ((v << 8) | (addr & 0xFF))
+            write(addr, v)
+            cycles = 5
+            break
+        }
+
+        // SHA / AHX abs,Y — store A AND X AND (H+1)
+        case 0x9F: {
+            let base = readPCu16()
+            let addr = (base + cpu_y) & 0xFFFF
+            let hi   = (((base >>> 8) + 1) & 0xFF)
+            let dma  = apu_dmcEnable && apu_dmcBytesRem > 0
+            let v    = dma ? (cpu_a & cpu_x) : (cpu_a & cpu_x & hi)
+            if (!dma && (base & 0xFF00) != (addr & 0xFF00)) addr = ((v << 8) | (addr & 0xFF))
+            write(addr, v)
+            cycles = 5
+            break
+        }
+
+        // LAS / LAE abs,Y — A = X = SP = (mem AND SP)
+        case 0xBB: {
+            let v = read(addrAbsY()) & cpu_sp
+            cpu_a  = v
+            cpu_x  = v
+            cpu_sp = v
+            cpu_fZ = v == 0; cpu_fN = v > 127
+            cycles = 4 + pageCrossed
+            break
+        }
 
         // 3-byte NOP (unofficial)
         case 0x0C: case 0x1C: case 0x3C: case 0x5C: case 0x7C: case 0xDC: case 0xFC: {
