@@ -2962,15 +2962,19 @@ function stepPPU() {
 
             // --- Scanline-end actions ---
 
-            // Vblank set + frame boundary — drawNewFrame fires ONLY here (scanline-end).
-            // ppuVblank is set early at dot 1 (mid-scanline check below) for NMI timing,
-            // but drawNewFrame must fire exactly once per NES frame.
-            if (sl == 241) {
+            // Vblank set + frame boundary. Real PPU sets PPUSTATUS bit 7 at scanline 241,
+            // dot 1 (TriCnes_Emulator.cs:1397/1464). In our per-scanline model the closest
+            // approximation is "finishing scanline 240" → the next dot is sl=241 dot 0.
+            // Triggering at sl==241 (one scanline later) lands the rise ~340 PPU dots /
+            // ~113 CPU cycles too late, which is enough to break AccuracyCoin NMI tests.
+            if (sl == 240) {
                 ppu_vblank    = true
                 ppu_drawNewFrame = true
             }
-            // Pre-render line: clear status flags + reset Y scroll + rebuild sprite schedule
-            if (sl == 261) {
+            // Pre-render line actions. Real PPU clears vblank/sprite0/overflow at sl=261
+            // dot 1 (TriCnes_Emulator.cs:1446). Fire at "finishing scanline 260" so the
+            // clear lands at the start of pre-render, not the start of the next visible frame.
+            if (sl == 260) {
                 ppu_vblank            = false
                 e.ppuStatusOverflow    = false
                 e.ppuStatusSprZeroHit  = false
