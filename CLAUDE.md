@@ -126,6 +126,12 @@ while (!appexit) {
 | MMC3 IRQ timing | Per-dot (A12 rise) | Per-scanline approximation (±1 scanline accuracy) |
 | OAM DMA timing | Accurate cycle count | 513 cycles (alignment not modelled) |
 | Sprite overflow | Accurate | Detected at schedule-build time only |
+| CPU open bus | Per-pin floating | `dataBus` tracks last bus value; controller bits 5-7 = open bus; $4015 read leaves bus unchanged |
+| PPU open bus | Per-bit decay | Single-byte `ppu_bus`, decays to 0 after ~600k CPU cycles (~20 frames); $2002 read updates upper 3 bits only |
+| Dummy reads (indexed) | Per-cycle exact | abs,X/abs,Y/(ind),Y: dummy read at un-fixed-high addr on page cross for loads; always for stores/RMW |
+| Dummy writes (RMW) | Per-cycle exact | RMW writes original value back before the modified value (observable on $2007 etc.) |
+| Implied/branch dummy reads | Per-cycle exact | **Not implemented** (would need per-cycle accuracy) |
+| PPU bus decay timing | Per-bit, ~30 frames | Single timer for whole byte; ~20 frames flat |
 
 ## Optimisations (accuracy vs. speed trade-offs)
 

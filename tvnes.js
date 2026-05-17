@@ -46,6 +46,11 @@ let cpu_totalCycles = 0
 // ── Hot PPU/loop flags hoisted out of e (read every CPU instruction or every scanline) ──
 let ppu_vblank = false, ppu_enableNMI = false
 let ppu_cycleBudget = 0, ppu_drawNewFrame = false, ppu_skipRender = false
+// PPU open bus (the 8 bits shared between the CPU↔PPU register port). Updated by
+// any CPU write to $2000-$3FFF, and by reads from $2002/$2004/$2007. Decays to 0
+// after ~20 frames of inactivity. See TriCnes_Emulator.cs PPUBus / PPUBusDecay.
+let ppu_bus = 0, ppu_busDecayCycle = 0
+const PPU_BUS_DECAY_CYCLES = 600000  // ~20 NTSC frames (~30 frames worst case)
 
 // ── APU state (module-level, follows cpu_* / ppu_* convention for GraalJS perf) ──
 // Pulse 1
@@ -402,6 +407,7 @@ function readPCu16() {
         hi = read(pc + 1)
     }
     cpu_pc = (pc + 2) & 0xFFFF
+    dataBus = hi   // last byte on the bus is the high byte (matters for open bus)
     return (hi << 8) | lo
 }
 
@@ -1075,33 +1081,52 @@ function read(offset) {
     // PPU registers ($2000–$3FFF, mirrors of $2000–$2007)
     if (offset < 0x4000) {
         offset &= 0x2007
+        // PPU open bus has its own bus separate from the CPU data bus (the CPU
+        // reads whatever the PPU is driving). Decay it lazily.
+        if ((cpu_totalCycles - ppu_busDecayCycle) > PPU_BUS_DECAY_CYCLES) ppu_bus = 0
         switch (offset) {
-            case 0x2002: { // PPUSTATUS — lower 5 bits are open bus
-                let ppuStatus = (dataBus & 0x1F)
-                if (ppu_vblank)            ppuStatus |= 0x80
+            case 0x2002: { // PPUSTATUS — top 3 bits from status, low 5 bits are PPU open bus
+                let ppuStatus = (ppu_bus & 0x1F)
+                if (ppu_vblank)             ppuStatus |= 0x80
                 if (e.ppuStatusSprZeroHit)  ppuStatus |= 0x40
                 if (e.ppuStatusOverflow)    ppuStatus |= 0x20
                 ppu_vblank   = false
-                e.writeLatch  = false
+                e.writeLatch = false
+                // $2002 read updates the upper 3 bits of ppu_bus only
+                ppu_bus = (ppuStatus & 0xE0) | (ppu_bus & 0x1F)
+                ppu_busDecayCycle = cpu_totalCycles
                 return dataBus = ppuStatus
             }
+            case 0x2004: { // OAMDATA — updates all 8 bits of ppu_bus
+                let v = oamArr[e.ppuOAMaddr]
+                ppu_bus = v
+                ppu_busDecayCycle = cpu_totalCycles
+                return dataBus = v
+            }
             case 0x2007: { // PPUDATA (buffered read)
-                let temp = e.ppuReadBuffer
+                let v
                 let vramAddr = e.vramAddr
                 if (vramAddr >= 0x3F00) {
-                    temp = readPPU(vramAddr)
+                    // Palette read: low 6 bits from palette, top 2 bits preserved from ppu_bus
+                    v = (readPPU(vramAddr) & 0x3F) | (ppu_bus & 0xC0)
+                    e.ppuReadBuffer = readPPU(vramAddr & 0x2FFF)  // also fills buffer from underlying nametable
                 } else {
+                    v = e.ppuReadBuffer
                     e.ppuReadBuffer = readPPU(vramAddr)
                 }
                 e.vramAddr = (vramAddr + (e.ppuVramInc32Mode ? 32 : 1)) & 0x3FFF
-                return dataBus = temp
+                ppu_bus = v
+                ppu_busDecayCycle = cpu_totalCycles
+                return dataBus = v
             }
-            default: return dataBus  // write-only regs return open bus
+            // $2000/$2001/$2003/$2005/$2006 — write-only, read returns PPU open bus
+            default: return dataBus = ppu_bus
         }
     }
-    // APU status register ($4015) — reading also clears frame IRQ flag
+    // APU status register ($4015) — reading also clears frame IRQ flag.
+    // Bit 5 is not driven by the APU (open bus from dataBus).
     if (offset == 0x4015) {
-        let s = 0
+        let s = dataBus & 0x20
         if (apu_p1LenCnt  > 0) s |= 1
         if (apu_p2LenCnt  > 0) s |= 2
         if (apu_triLenCnt > 0) s |= 4
@@ -1114,16 +1139,17 @@ function read(offset) {
         return s // Reading from $4015 should not update the databus.
     }
     // Controller 1 ($4016) — NES shift register sends LSB first (A=bit0, B=bit1, ...)
+    // Upper 3 bits (bits 5-7) are CPU open bus (whatever was last on dataBus).
     if (offset == 0x4016) {
         let bit = e.cnt1sr & 1
         e.cnt1sr = e.cnt1sr >>> 1
-        return dataBus = bit
+        return dataBus = bit | (dataBus & 0xE0)
     }
     // Controller 2 ($4017)
     if (offset == 0x4017) {
         let bit = e.cnt2sr & 1
         e.cnt2sr = e.cnt2sr >>> 1
-        return dataBus = bit
+        return dataBus = bit | (dataBus & 0xE0)
     }
     // PRG ROM ($8000–$FFFF)
     if (offset >= 0x8000) return dataBus = romArr[offset - 0x8000]
@@ -1146,6 +1172,9 @@ function write(offset0, value) {
     if (offset < 0x2000) { ramArr[offset & 0x7FF] = value; return }
     // PPU registers
     if (offset < 0x4000) {
+        // Every CPU write to a PPU register refreshes the PPU open bus.
+        ppu_bus = value
+        ppu_busDecayCycle = cpu_totalCycles
         offset &= 0x2007
         switch (offset) {
             case 0x2000: // PPUCTRL
@@ -2050,7 +2079,9 @@ function doBranchingOnPredicate(p) {
 // Zero-page is always CPU RAM — bypass read() dispatch.
 function readZpU16(addr) {
     let a = addr & 0xFF
-    return ramArr[a] | (ramArr[(a + 1) & 0xFF] << 8)
+    let hi = ramArr[(a + 1) & 0xFF]
+    dataBus = hi   // for open bus accuracy: last byte on bus is the high byte
+    return ramArr[a] | (hi << 8)
 }
 
 function readU16Wrap(addr) {
@@ -2062,22 +2093,69 @@ function readU16Wrap(addr) {
 // ── Item 5: addressing modes use top-level readPC/readPCu16 ──
 function addrZpX()  { return (readPC() + cpu_x) & 0xFF }
 function addrZpY()  { return (readPC() + cpu_y) & 0xFF }
+
+// abs,X / abs,Y / (ind),Y — READ form. The dummy read at the un-fixed-high address
+// only happens when adding the index crosses a page boundary (the CPU realises
+// it needs to repeat the fetch with the high byte fixed up). The dummy read
+// goes through read() so MMIO side effects (e.g. clearing $2002 vblank flag,
+// updating ppu_bus) fire correctly.
 function addrAbsX() {
     let base = readPCu16()
     let addr = (base + cpu_x) & 0xFFFF
-    pageCrossed = (base & 0xFF00) != (addr & 0xFF00)
+    if ((base & 0xFF00) != (addr & 0xFF00)) {
+        read((base & 0xFF00) | (addr & 0xFF))   // dummy read at un-fixed addr
+        pageCrossed = true
+    } else {
+        pageCrossed = false
+    }
     return addr
 }
 function addrAbsY() {
     let base = readPCu16()
     let addr = (base + cpu_y) & 0xFFFF
-    pageCrossed = (base & 0xFF00) != (addr & 0xFF00)
+    if ((base & 0xFF00) != (addr & 0xFF00)) {
+        read((base & 0xFF00) | (addr & 0xFF))
+        pageCrossed = true
+    } else {
+        pageCrossed = false
+    }
     return addr
 }
 function addrIndX() { return readZpU16((readPC() + cpu_x) & 0xFF) }
 function addrIndY() {
     let base = readZpU16(readPC())
     let addr = (base + cpu_y) & 0xFFFF
+    if ((base & 0xFF00) != (addr & 0xFF00)) {
+        read((base & 0xFF00) | (addr & 0xFF))
+        pageCrossed = true
+    } else {
+        pageCrossed = false
+    }
+    return addr
+}
+
+// abs,X / abs,Y / (ind),Y — WRITE form (also used by RMW). The 6502 always
+// performs the dummy read at the un-fixed-high address for stores and RMW,
+// regardless of whether a page boundary is crossed (it commits to the extra
+// cycle before knowing the result of the high-byte fix-up).
+function addrAbsXW() {
+    let base = readPCu16()
+    let addr = (base + cpu_x) & 0xFFFF
+    read((base & 0xFF00) | (addr & 0xFF))   // always dummy read
+    pageCrossed = (base & 0xFF00) != (addr & 0xFF00)
+    return addr
+}
+function addrAbsYW() {
+    let base = readPCu16()
+    let addr = (base + cpu_y) & 0xFFFF
+    read((base & 0xFF00) | (addr & 0xFF))
+    pageCrossed = (base & 0xFF00) != (addr & 0xFF00)
+    return addr
+}
+function addrIndYW() {
+    let base = readZpU16(readPC())
+    let addr = (base + cpu_y) & 0xFFFF
+    read((base & 0xFF00) | (addr & 0xFF))
     pageCrossed = (base & 0xFF00) != (addr & 0xFF00)
     return addr
 }
@@ -2127,48 +2205,59 @@ function doROR(val) {
 // Used by SLO/RLA/SRE/RRA/DCP/ISC variants. All take an effective address
 // (the addressing-mode helper sets pageCrossed for the caller's cycle math,
 // but unofficial RMW opcodes always take the fixed worst-case count).
+// RMW helpers — each performs read, dummy write of original value, then write
+// of the modified value. The dummy write is observable when targeting MMIO
+// (e.g. STA $2007-like behavior fires twice).
 function doSLO(addr) {
-    let v = read(addr)
-    cpu_fC = (v & 0x80) != 0
-    v = (v << 1) & 0xFF
+    let o = read(addr)
+    write(addr, o)               // dummy write
+    cpu_fC = (o & 0x80) != 0
+    let v = (o << 1) & 0xFF
     write(addr, v)
     cpu_a |= v
     cpu_fZ = cpu_a == 0; cpu_fN = cpu_a > 127
 }
 function doRLA(addr) {
-    let v = read(addr)
+    let o = read(addr)
+    write(addr, o)
     let oldC = cpu_fC ? 1 : 0
-    cpu_fC = (v & 0x80) != 0
-    v = ((v << 1) | oldC) & 0xFF
+    cpu_fC = (o & 0x80) != 0
+    let v = ((o << 1) | oldC) & 0xFF
     write(addr, v)
     cpu_a &= v
     cpu_fZ = cpu_a == 0; cpu_fN = cpu_a > 127
 }
 function doSRE(addr) {
-    let v = read(addr)
-    cpu_fC = (v & 1) != 0
-    v = v >>> 1
+    let o = read(addr)
+    write(addr, o)
+    cpu_fC = (o & 1) != 0
+    let v = o >>> 1
     write(addr, v)
     cpu_a ^= v
     cpu_fZ = cpu_a == 0; cpu_fN = cpu_a > 127
 }
 function doRRA(addr) {
-    let v = read(addr)
+    let o = read(addr)
+    write(addr, o)
     let oldC = cpu_fC ? 128 : 0
-    cpu_fC = (v & 1) != 0
-    v = (v >>> 1) | oldC
+    cpu_fC = (o & 1) != 0
+    let v = (o >>> 1) | oldC
     write(addr, v)
     doADC(v)
 }
 function doDCP(addr) {
-    let v = (read(addr) - 1) & 0xFF
+    let o = read(addr)
+    write(addr, o)
+    let v = (o - 1) & 0xFF
     write(addr, v)
     cpu_fC = cpu_a >= v
     let d = (cpu_a - v) & 0xFF
     cpu_fZ = d == 0; cpu_fN = (d & 0x80) != 0
 }
 function doISC(addr) {
-    let v = (read(addr) + 1) & 0xFF
+    let o = read(addr)
+    write(addr, o)
+    let v = (o + 1) & 0xFF
     write(addr, v)
     doSBC(v)
 }
@@ -2199,6 +2288,7 @@ function emulateCPU() {
         if (pc >= 0x8000) {
             opcode = romArr[pc - 0x8000]
             cpu_pc = (pc + 1) & 0xFFFF
+            dataBus = opcode  // ROM fast path bypasses read(); update bus by hand
         } else {
             opcode = read(pc)
             cpu_pc = (pc + 1) & 0xFFFF
@@ -2239,10 +2329,10 @@ function emulateCPU() {
 
         // ASL
         case 0x0A: cpu_fC = (cpu_a&0x80)!=0; cpu_a=(cpu_a<<1)&0xFF; cpu_fZ = cpu_a==0; cpu_fN = cpu_a>127; cycles = 2; break
-        case 0x06: temp = readPC();    write(temp, doASL(read(temp))); cycles = 5; break
-        case 0x16: temp = addrZpX();   write(temp, doASL(read(temp))); cycles = 6; break
-        case 0x0E: temp = readPCu16(); write(temp, doASL(read(temp))); cycles = 6; break
-        case 0x1E: temp = addrAbsX();  write(temp, doASL(read(temp))); cycles = 7; break
+        case 0x06: { temp = readPC();    let v=read(temp); write(temp,v); write(temp, doASL(v)); cycles = 5; break }
+        case 0x16: { temp = addrZpX();   let v=read(temp); write(temp,v); write(temp, doASL(v)); cycles = 6; break }
+        case 0x0E: { temp = readPCu16(); let v=read(temp); write(temp,v); write(temp, doASL(v)); cycles = 6; break }
+        case 0x1E: { temp = addrAbsXW(); let v=read(temp); write(temp,v); write(temp, doASL(v)); cycles = 7; break }
 
         case 0x08: push(packFlags(true)); cycles = 3; break  // PHP
         case 0x10: doBranchingOnPredicate(!cpu_fN);  break  // BPL
@@ -2267,10 +2357,10 @@ function emulateCPU() {
 
         // ROL
         case 0x2A: { let c=cpu_fC?1:0; cpu_fC=(cpu_a&0x80)!=0; cpu_a=((cpu_a<<1)|c)&0xFF; cpu_fZ=cpu_a==0; cpu_fN=cpu_a>127; cycles=2; break }
-        case 0x26: temp = readPC();    write(temp, doROL(read(temp))); cycles = 5; break
-        case 0x36: temp = addrZpX();   write(temp, doROL(read(temp))); cycles = 6; break
-        case 0x2E: temp = readPCu16(); write(temp, doROL(read(temp))); cycles = 6; break
-        case 0x3E: temp = addrAbsX();  write(temp, doROL(read(temp))); cycles = 7; break
+        case 0x26: { temp = readPC();    let v=read(temp); write(temp,v); write(temp, doROL(v)); cycles = 5; break }
+        case 0x36: { temp = addrZpX();   let v=read(temp); write(temp,v); write(temp, doROL(v)); cycles = 6; break }
+        case 0x2E: { temp = readPCu16(); let v=read(temp); write(temp,v); write(temp, doROL(v)); cycles = 6; break }
+        case 0x3E: { temp = addrAbsXW(); let v=read(temp); write(temp,v); write(temp, doROL(v)); cycles = 7; break }
 
         case 0x28: unpackFlags(pull()); cycles = 4; break  // PLP
         case 0x30: doBranchingOnPredicate(cpu_fN);  break  // BMI
@@ -2291,10 +2381,10 @@ function emulateCPU() {
 
         // LSR
         case 0x4A: cpu_fC = (cpu_a&1)!=0; cpu_a>>>=1; cpu_fZ = cpu_a==0; cpu_fN = false; cycles = 2; break
-        case 0x46: temp = readPC();    write(temp, doLSR(read(temp))); cycles = 5; break
-        case 0x56: temp = addrZpX();   write(temp, doLSR(read(temp))); cycles = 6; break
-        case 0x4E: temp = readPCu16(); write(temp, doLSR(read(temp))); cycles = 6; break
-        case 0x5E: temp = addrAbsX();  write(temp, doLSR(read(temp))); cycles = 7; break
+        case 0x46: { temp = readPC();    let v=read(temp); write(temp,v); write(temp, doLSR(v)); cycles = 5; break }
+        case 0x56: { temp = addrZpX();   let v=read(temp); write(temp,v); write(temp, doLSR(v)); cycles = 6; break }
+        case 0x4E: { temp = readPCu16(); let v=read(temp); write(temp,v); write(temp, doLSR(v)); cycles = 6; break }
+        case 0x5E: { temp = addrAbsXW(); let v=read(temp); write(temp,v); write(temp, doLSR(v)); cycles = 7; break }
 
         case 0x48: push(cpu_a); cycles = 3; break             // PHA
         case 0x4C: cpu_pc = readPCu16(); cycles = 3; break    // JMP abs
@@ -2318,10 +2408,10 @@ function emulateCPU() {
 
         // ROR
         case 0x6A: { let c=cpu_fC?128:0; cpu_fC=(cpu_a&1)!=0; cpu_a=(cpu_a>>>1)|c; cpu_fZ=cpu_a==0; cpu_fN=cpu_a>127; cycles=2; break }
-        case 0x66: temp = readPC();    write(temp, doROR(read(temp))); cycles = 5; break
-        case 0x76: temp = addrZpX();   write(temp, doROR(read(temp))); cycles = 6; break
-        case 0x6E: temp = readPCu16(); write(temp, doROR(read(temp))); cycles = 6; break
-        case 0x7E: temp = addrAbsX();  write(temp, doROR(read(temp))); cycles = 7; break
+        case 0x66: { temp = readPC();    let v=read(temp); write(temp,v); write(temp, doROR(v)); cycles = 5; break }
+        case 0x76: { temp = addrZpX();   let v=read(temp); write(temp,v); write(temp, doROR(v)); cycles = 6; break }
+        case 0x6E: { temp = readPCu16(); let v=read(temp); write(temp,v); write(temp, doROR(v)); cycles = 6; break }
+        case 0x7E: { temp = addrAbsXW(); let v=read(temp); write(temp,v); write(temp, doROR(v)); cycles = 7; break }
 
         case 0x68: cpu_a = pull(); cpu_fZ = cpu_a==0; cpu_fN = cpu_a>127; cycles = 4; break  // PLA
         case 0x70: doBranchingOnPredicate(cpu_fV); break  // BVS
@@ -2331,10 +2421,10 @@ function emulateCPU() {
         case 0x81: write(addrIndX(), cpu_a); cycles = 6; break
         case 0x85: ramArr[readPC()] = cpu_a; cycles = 3; break
         case 0x8D: { let a=readPCu16(); if(a<0x2000)ramArr[a&0x7FF]=cpu_a; else write(a,cpu_a); cycles=4; break }
-        case 0x91: write(addrIndY(), cpu_a); cycles = 6; break
-        case 0x95: write(addrZpX(),  cpu_a); cycles = 4; break
-        case 0x99: write(addrAbsY(), cpu_a); cycles = 5; break
-        case 0x9D: write(addrAbsX(), cpu_a); cycles = 5; break
+        case 0x91: write(addrIndYW(), cpu_a); cycles = 6; break
+        case 0x95: write(addrZpX(),   cpu_a); cycles = 4; break
+        case 0x99: write(addrAbsYW(), cpu_a); cycles = 5; break
+        case 0x9D: write(addrAbsXW(), cpu_a); cycles = 5; break
 
         // STY
         case 0x84: ramArr[readPC()] = cpu_y; cycles = 3; break
@@ -2403,16 +2493,16 @@ function emulateCPU() {
         case 0xEC: doCMP(cpu_x, read(readPCu16()));  cycles = 4; break
 
         // DEC
-        case 0xC6: temp = readPC();    { let v=(read(temp)-1)&0xFF; write(temp,v); cpu_fZ=v==0; cpu_fN=v>127; } cycles = 5; break
-        case 0xD6: temp = addrZpX();   { let v=(read(temp)-1)&0xFF; write(temp,v); cpu_fZ=v==0; cpu_fN=v>127; } cycles = 6; break
-        case 0xCE: temp = readPCu16(); { let v=(read(temp)-1)&0xFF; write(temp,v); cpu_fZ=v==0; cpu_fN=v>127; } cycles = 6; break
-        case 0xDE: temp = addrAbsX();  { let v=(read(temp)-1)&0xFF; write(temp,v); cpu_fZ=v==0; cpu_fN=v>127; } cycles = 7; break
+        case 0xC6: temp = readPC();    { let o=read(temp); write(temp,o); let v=(o-1)&0xFF; write(temp,v); cpu_fZ=v==0; cpu_fN=v>127; } cycles = 5; break
+        case 0xD6: temp = addrZpX();   { let o=read(temp); write(temp,o); let v=(o-1)&0xFF; write(temp,v); cpu_fZ=v==0; cpu_fN=v>127; } cycles = 6; break
+        case 0xCE: temp = readPCu16(); { let o=read(temp); write(temp,o); let v=(o-1)&0xFF; write(temp,v); cpu_fZ=v==0; cpu_fN=v>127; } cycles = 6; break
+        case 0xDE: temp = addrAbsXW(); { let o=read(temp); write(temp,o); let v=(o-1)&0xFF; write(temp,v); cpu_fZ=v==0; cpu_fN=v>127; } cycles = 7; break
 
         // INC
-        case 0xE6: temp = readPC();    { let v=(read(temp)+1)&0xFF; write(temp,v); cpu_fZ=v==0; cpu_fN=v>127; } cycles = 5; break
-        case 0xF6: temp = addrZpX();   { let v=(read(temp)+1)&0xFF; write(temp,v); cpu_fZ=v==0; cpu_fN=v>127; } cycles = 6; break
-        case 0xEE: temp = readPCu16(); { let v=(read(temp)+1)&0xFF; write(temp,v); cpu_fZ=v==0; cpu_fN=v>127; } cycles = 6; break
-        case 0xFE: temp = addrAbsX();  { let v=(read(temp)+1)&0xFF; write(temp,v); cpu_fZ=v==0; cpu_fN=v>127; } cycles = 7; break
+        case 0xE6: temp = readPC();    { let o=read(temp); write(temp,o); let v=(o+1)&0xFF; write(temp,v); cpu_fZ=v==0; cpu_fN=v>127; } cycles = 5; break
+        case 0xF6: temp = addrZpX();   { let o=read(temp); write(temp,o); let v=(o+1)&0xFF; write(temp,v); cpu_fZ=v==0; cpu_fN=v>127; } cycles = 6; break
+        case 0xEE: temp = readPCu16(); { let o=read(temp); write(temp,o); let v=(o+1)&0xFF; write(temp,v); cpu_fZ=v==0; cpu_fN=v>127; } cycles = 6; break
+        case 0xFE: temp = addrAbsXW(); { let o=read(temp); write(temp,o); let v=(o+1)&0xFF; write(temp,v); cpu_fZ=v==0; cpu_fN=v>127; } cycles = 7; break
 
         case 0xC8: cpu_y = (cpu_y+1)&0xFF; cpu_fZ = cpu_y==0; cpu_fN = cpu_y>127; cycles = 2; break  // INY
         case 0xCA: cpu_x = (cpu_x-1)&0xFF; cpu_fZ = cpu_x==0; cpu_fN = cpu_x>127; cycles = 2; break  // DEX
@@ -2440,37 +2530,37 @@ function emulateCPU() {
         case 0x03: doSLO(addrIndX());  cycles = 8; break
         case 0x07: doSLO(readPC());    cycles = 5; break
         case 0x0F: doSLO(readPCu16()); cycles = 6; break
-        case 0x13: doSLO(addrIndY());  cycles = 8; break
+        case 0x13: doSLO(addrIndYW()); cycles = 8; break
         case 0x17: doSLO(addrZpX());   cycles = 6; break
-        case 0x1B: doSLO(addrAbsY());  cycles = 7; break
-        case 0x1F: doSLO(addrAbsX());  cycles = 7; break
+        case 0x1B: doSLO(addrAbsYW()); cycles = 7; break
+        case 0x1F: doSLO(addrAbsXW()); cycles = 7; break
 
         // RLA — ROL mem, then AND mem into A
         case 0x23: doRLA(addrIndX());  cycles = 8; break
         case 0x27: doRLA(readPC());    cycles = 5; break
         case 0x2F: doRLA(readPCu16()); cycles = 6; break
-        case 0x33: doRLA(addrIndY());  cycles = 8; break
+        case 0x33: doRLA(addrIndYW()); cycles = 8; break
         case 0x37: doRLA(addrZpX());   cycles = 6; break
-        case 0x3B: doRLA(addrAbsY());  cycles = 7; break
-        case 0x3F: doRLA(addrAbsX());  cycles = 7; break
+        case 0x3B: doRLA(addrAbsYW()); cycles = 7; break
+        case 0x3F: doRLA(addrAbsXW()); cycles = 7; break
 
         // SRE — LSR mem, then EOR mem into A
         case 0x43: doSRE(addrIndX());  cycles = 8; break
         case 0x47: doSRE(readPC());    cycles = 5; break
         case 0x4F: doSRE(readPCu16()); cycles = 6; break
-        case 0x53: doSRE(addrIndY());  cycles = 8; break
+        case 0x53: doSRE(addrIndYW()); cycles = 8; break
         case 0x57: doSRE(addrZpX());   cycles = 6; break
-        case 0x5B: doSRE(addrAbsY());  cycles = 7; break
-        case 0x5F: doSRE(addrAbsX());  cycles = 7; break
+        case 0x5B: doSRE(addrAbsYW()); cycles = 7; break
+        case 0x5F: doSRE(addrAbsXW()); cycles = 7; break
 
         // RRA — ROR mem, then ADC mem into A
         case 0x63: doRRA(addrIndX());  cycles = 8; break
         case 0x67: doRRA(readPC());    cycles = 5; break
         case 0x6F: doRRA(readPCu16()); cycles = 6; break
-        case 0x73: doRRA(addrIndY());  cycles = 8; break
+        case 0x73: doRRA(addrIndYW()); cycles = 8; break
         case 0x77: doRRA(addrZpX());   cycles = 6; break
-        case 0x7B: doRRA(addrAbsY());  cycles = 7; break
-        case 0x7F: doRRA(addrAbsX());  cycles = 7; break
+        case 0x7B: doRRA(addrAbsYW()); cycles = 7; break
+        case 0x7F: doRRA(addrAbsXW()); cycles = 7; break
 
         // SAX — store (A AND X); flags untouched
         case 0x83: write(addrIndX(),  cpu_a & cpu_x); cycles = 6; break
@@ -2490,19 +2580,19 @@ function emulateCPU() {
         case 0xC3: doDCP(addrIndX());  cycles = 8; break
         case 0xC7: doDCP(readPC());    cycles = 5; break
         case 0xCF: doDCP(readPCu16()); cycles = 6; break
-        case 0xD3: doDCP(addrIndY());  cycles = 8; break
+        case 0xD3: doDCP(addrIndYW()); cycles = 8; break
         case 0xD7: doDCP(addrZpX());   cycles = 6; break
-        case 0xDB: doDCP(addrAbsY());  cycles = 7; break
-        case 0xDF: doDCP(addrAbsX());  cycles = 7; break
+        case 0xDB: doDCP(addrAbsYW()); cycles = 7; break
+        case 0xDF: doDCP(addrAbsXW()); cycles = 7; break
 
         // ISC / ISB — INC mem, then SBC mem from A
         case 0xE3: doISC(addrIndX());  cycles = 8; break
         case 0xE7: doISC(readPC());    cycles = 5; break
         case 0xEF: doISC(readPCu16()); cycles = 6; break
-        case 0xF3: doISC(addrIndY());  cycles = 8; break
+        case 0xF3: doISC(addrIndYW()); cycles = 8; break
         case 0xF7: doISC(addrZpX());   cycles = 6; break
-        case 0xFB: doISC(addrAbsY());  cycles = 7; break
-        case 0xFF: doISC(addrAbsX());  cycles = 7; break
+        case 0xFB: doISC(addrAbsYW()); cycles = 7; break
+        case 0xFF: doISC(addrAbsXW()); cycles = 7; break
 
         // ANC — AND #imm, then copy bit 7 of result to C
         case 0x0B: case 0x2B:
@@ -2578,6 +2668,7 @@ function emulateCPU() {
         case 0x93: {
             let base = readZpU16(readPC())
             let addr = (base + cpu_y) & 0xFFFF
+            read((base & 0xFF00) | (addr & 0xFF))   // dummy read at un-fixed addr
             let hi   = (((base >>> 8) + 1) & 0xFF)
             let dma  = apu_dmcEnable && apu_dmcBytesRem > 0
             let v    = dma ? (cpu_a & cpu_x) : (cpu_a & cpu_x & hi)
@@ -2591,6 +2682,7 @@ function emulateCPU() {
         case 0x9B: {
             let base = readPCu16()
             let addr = (base + cpu_y) & 0xFFFF
+            read((base & 0xFF00) | (addr & 0xFF))   // dummy read at un-fixed addr
             cpu_sp   = cpu_a & cpu_x
             let hi   = (((base >>> 8) + 1) & 0xFF)
             let dma  = apu_dmcEnable && apu_dmcBytesRem > 0
@@ -2605,6 +2697,7 @@ function emulateCPU() {
         case 0x9C: {
             let base = readPCu16()
             let addr = (base + cpu_x) & 0xFFFF
+            read((base & 0xFF00) | (addr & 0xFF))
             let hi   = (((base >>> 8) + 1) & 0xFF)
             let dma  = apu_dmcEnable && apu_dmcBytesRem > 0
             let v    = dma ? cpu_y : (cpu_y & hi)
@@ -2618,6 +2711,7 @@ function emulateCPU() {
         case 0x9E: {
             let base = readPCu16()
             let addr = (base + cpu_y) & 0xFFFF
+            read((base & 0xFF00) | (addr & 0xFF))
             let hi   = (((base >>> 8) + 1) & 0xFF)
             let dma  = apu_dmcEnable && apu_dmcBytesRem > 0
             let v    = dma ? cpu_x : (cpu_x & hi)
@@ -2631,6 +2725,7 @@ function emulateCPU() {
         case 0x9F: {
             let base = readPCu16()
             let addr = (base + cpu_y) & 0xFFFF
+            read((base & 0xFF00) | (addr & 0xFF))
             let hi   = (((base >>> 8) + 1) & 0xFF)
             let dma  = apu_dmcEnable && apu_dmcBytesRem > 0
             let v    = dma ? (cpu_a & cpu_x) : (cpu_a & cpu_x & hi)
@@ -2651,11 +2746,16 @@ function emulateCPU() {
             break
         }
 
-        // 3-byte NOP (unofficial)
+        // 3-byte NOP (unofficial) — on real silicon these still issue the read,
+        // so the dummy read on page cross + the target read fire (observable on
+        // MMIO like $2002, and important for open-bus state).
         case 0x0C: case 0x1C: case 0x3C: case 0x5C: case 0x7C: case 0xDC: case 0xFC: {
-            let base = readPCu16()
-            let addr = (base + cpu_x) & 0xFFFF
-            pageCrossed = opcode != 0x0C && (base & 0xFF00) != (addr & 0xFF00)
+            if (opcode == 0x0C) {
+                read(readPCu16())   // pure absolute, no indexing
+                pageCrossed = false
+            } else {
+                read(addrAbsX())    // addrAbsX() does the dummy read on page cross
+            }
             cycles = 4 + pageCrossed
             break
         }
