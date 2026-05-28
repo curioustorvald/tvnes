@@ -43,6 +43,7 @@ let cpu_halted = false
 let cpu_nmiLevel = false, cpu_doNMI = false, cpu_nmiFired = 0
 let cpu_irqLevel = false, cpu_doIRQ = false  // level-triggered IRQ (MMC3)
 let cpu_totalCycles = 0
+let cpu_instrCycle = 0   // CPU cycle offset within the current instruction (1 = opcode fetch); lets MMIO accesses know their exact cycle for cycle-accurate APU frame-counter catch-up
 // ── Hot PPU/loop flags hoisted out of e (read every CPU instruction or every scanline) ──
 let ppu_vblank = false, ppu_enableNMI = false
 let ppu_cycleBudget = 0, ppu_drawNewFrame = false, ppu_skipRender = false
@@ -82,7 +83,12 @@ let apu_dmcShifter = 0, apu_dmcShiftCnt = 8, apu_dmcSilent = true
 let apu_dmcEnable = false, apu_dmcIrqFlag = false
 // Frame counter
 let apu_fcMode = 0, apu_fcInhibitIrq = false, apu_fcCycles = 0
-let apu_fcResetDelay = 0, apu_fcIrqFlag = false
+let apu_fcResetDelay = -1, apu_fcIrqFlag = false   // -1 = no pending $4017 reset
+// Cycle-accurate frame counter bookkeeping (see apuRunFC)
+let apu_fcAbs = 0              // absolute CPU cycle the frame counter has been advanced to
+let apu_putCycle = true        // APU get/put parity, toggles every CPU cycle (matches TriCnes power-on = put)
+let apu_fcClearPending = false // set by $4015 read; frame IRQ flag cleared on the next put cycle
+let apu_oamDmaStall = 0        // OAM DMA CPU stall (513/514) deferred to run(): the STA opcode sets cycles=4 *after* write(), which would clobber a direct cycles +=
 // Audio output bookkeeping
 let apu_sampleAcc = 0.0        // fractional accumulator for 32 kHz downsampling
 let apu_dmcBuf = new Uint8Array(1200)   // 600 stereo u8 samples per frame (headroom)
@@ -385,7 +391,9 @@ let dataBus = 0
 
 function readPC() {
     let pc = cpu_pc
-    let v = pc >= 0x8000 ? romArr[pc - 0x8000] : read(pc)
+    let v
+    if (pc >= 0x8000) { v = romArr[pc - 0x8000]; cpu_instrCycle++ }  // ROM fast path bypasses read(); count the fetch cycle by hand
+    else              { v = read(pc) }                              // RAM path: read() counts the cycle
     cpu_pc = (pc + 1) & 0xFFFF
     dataBus = v
     return v
@@ -402,8 +410,9 @@ function readPCu16() {
     if (pc >= 0x8000) {
         lo = romArr[pc - 0x8000]
         hi = romArr[(pc + 1) - 0x8000]
+        cpu_instrCycle += 2   // ROM fast path bypasses read(); count both fetch cycles
     } else {
-        lo = read(pc)
+        lo = read(pc)         // RAM path: each read() counts its cycle
         hi = read(pc + 1)
     }
     cpu_pc = (pc + 2) & 0xFFFF
@@ -1076,6 +1085,7 @@ if (fullFilePath === undefined) {
 
 // ── Item 1: read() uses typed arrays, zero sys.peek in hot path ──
 function read(offset) {
+    cpu_instrCycle++   // every read() is one CPU bus cycle (used for cycle-accurate APU catch-up)
     // CPU RAM ($0000–$1FFF, 2KB mirrored)
     if (offset < 0x2000) return dataBus = ramArr[offset & 0x7FF]
     // PPU registers ($2000–$3FFF, mirrors of $2000–$2007)
@@ -1126,6 +1136,7 @@ function read(offset) {
     // APU status register ($4015) — reading also clears frame IRQ flag.
     // Bit 5 is not driven by the APU (open bus from dataBus).
     if (offset == 0x4015) {
+        apuFCToAccess()  // sample length counters / frame IRQ as of this read's exact cycle
         let s = dataBus & 0x20
         if (apu_p1LenCnt  > 0) s |= 1
         if (apu_p2LenCnt  > 0) s |= 2
@@ -1134,8 +1145,10 @@ function read(offset) {
         if (apu_dmcBytesRem > 0) s |= 16
         if (apu_fcIrqFlag)  s |= 64
         if (apu_dmcIrqFlag) s |= 128
-        apu_fcIrqFlag = false  // reading $4015 clears frame IRQ (simplified: no 1-cycle delay)
-        cpu_irqLevel = apu_dmcIrqFlag || mmc3_irqPending || fme7_irqPending || vrc6_irqPending
+        // Reading $4015 clears the frame IRQ flag, but not until the next APU put cycle
+        // (apuRunFC applies apu_fcClearPending). Reading on the cycle the flag is set will read it
+        // set and the clear is then overridden by the same-window re-set (AccuracyCoin IRQ test 7/E-G).
+        apu_fcClearPending = true
         return s // Reading from $4015 should not update the databus.
     }
     // Controller 1 ($4016) — NES shift register sends LSB first (A=bit0, B=bit1, ...)
@@ -1166,6 +1179,7 @@ function readSigned(offset) {
 
 // ── Item 1: write() uses typed arrays ──
 function write(offset0, value) {
+    cpu_instrCycle++   // every write() is one CPU bus cycle (used for cycle-accurate APU catch-up)
     dataBus = value
     let offset = offset0 & 0xFFFF
     // CPU RAM ($0000–$1FFF, 2KB mirrored)
@@ -1255,6 +1269,15 @@ function write(offset0, value) {
         switch (offset) {
             // ── Item 9: OAM DMA with bulk typed-array copy ──
             case 0x4014: {
+                // OAM DMA stalls the CPU. Hardware inserts an extra alignment cycle when needed so
+                // the CPU always resumes on a fixed (get) parity — AccuracyCoin frame-counter tests
+                // sync via STA $4014. Catch the frame counter up to the write (before the copy, so
+                // slow-path reads can't perturb cpu_instrCycle) to learn the parity, then charge
+                // 513/514 so the next instruction starts on a get cycle. The stall is deferred to
+                // run(): the STA opcode assigns cycles=4 *after* this write() returns, which would
+                // clobber a direct `cycles +=` here.
+                apuFCToAccess()
+                apu_oamDmaStall = apu_putCycle ? 514 : 513
                 let src = value << 8
                 if (src < 0x2000) {
                     // RAM source — fast path using typed array
@@ -1274,7 +1297,6 @@ function write(offset0, value) {
                         oamArr[i] = read(src + i)
                     }
                 }
-                cycles += 513  // OAM DMA CPU stall
                 break
             }
             // ── APU registers ──
@@ -1395,9 +1417,11 @@ function write(offset0, value) {
                 break
             // $4017 — frame counter mode + IRQ inhibit
             case 0x4017: {
+                apuFCToAccess()  // align the frame counter to this write's cycle
                 apu_fcMode       = (value & 0x80) != 0 ? 1 : 0
                 apu_fcInhibitIrq = (value & 0x40) != 0
-                apu_fcResetDelay = 3  // reset counter 3–4 CPU cycles later
+                // Counter resets 3 CPU cycles after a write on a put cycle, 4 after a get cycle.
+                apu_fcResetDelay = apu_putCycle ? 3 : 4
                 if (apu_fcInhibitIrq) {
                     apu_fcIrqFlag = false
                     cpu_irqLevel = apu_dmcIrqFlag || mmc3_irqPending || fme7_irqPending || vrc6_irqPending
@@ -1708,7 +1732,9 @@ function apuReset() {
     apu_dmcShifter = 0; apu_dmcShiftCnt = 8; apu_dmcSilent = true
     apu_dmcEnable = false; apu_dmcIrqFlag = false
     apu_fcMode = 0; apu_fcInhibitIrq = false; apu_fcCycles = 0
-    apu_fcResetDelay = 0; apu_fcIrqFlag = false
+    apu_fcResetDelay = -1; apu_fcIrqFlag = false
+    apu_fcAbs = cpu_totalCycles; apu_putCycle = true; apu_fcClearPending = false
+    apu_oamDmaStall = 0
     apu_sampleAcc = 0.0; apu_dmcWritePos = 0
     apu_frameCyclesStart = cpu_totalCycles
     apu_sliceCount = 1
@@ -1884,42 +1910,76 @@ function apuSnapNow() {
     }
 }
 
+// ── Cycle-accurate APU frame counter ──
+// Advance the frame counter one CPU cycle at a time up to absolute CPU cycle `targetAbs`,
+// mirroring TriCnes_Emulator.cs _EmulateAPU (frame-counter section + get/put parity + deferred
+// $4015 clear) so the AccuracyCoin frame-counter timing tests pass. `apu_fcAbs` tracks how far the
+// counter has advanced; MMIO handlers catch it up to the exact cycle of an access before servicing
+// it, and run() catches it up to the instruction boundary afterwards. Idempotent: never advances
+// past targetAbs, so a mid-instruction catch-up is never double-counted by the end-of-instruction one.
+function apuRunFC(targetAbs) {
+    while (apu_fcAbs < targetAbs) {
+        // apu_putCycle is the parity of the cycle about to be processed (toggled at the end).
+        // A pending $4015 frame-IRQ clear is applied on a put cycle, before this cycle's events
+        // (so an IRQ-set event later in the same cycle can re-assert the flag — tests E/F/G).
+        if (apu_putCycle && apu_fcClearPending) {
+            apu_fcClearPending = false
+            apu_fcIrqFlag = false
+            cpu_irqLevel = apu_dmcIrqFlag || mmc3_irqPending || fme7_irqPending || vrc6_irqPending
+        }
+
+        // $4017-write reset: count down (set to 3/4 cycles), zero the counter on underflow.
+        if (apu_fcResetDelay >= 0) {
+            apu_fcResetDelay--
+            if (apu_fcResetDelay < 0) apu_fcCycles = 0
+        }
+        apu_fcCycles++
+
+        if (apu_fcMode == 0) {
+            // 4-step: QF at 7457/14913/22371/29829, HF at 14913/29829, frame IRQ set 29828-29830.
+            switch (apu_fcCycles) {
+                case 7457:  apuClockQF(); apuSnapNow(); break
+                case 14913: apuClockQF(); apuClockHF(); apuSnapNow(); break
+                case 22371: apuClockQF(); apuSnapNow(); break
+                // The frame IRQ flag ($4015.6) is set UNCONDITIONALLY at 29828 and 29829 — even when
+                // IRQ is suppressed it reads back set for those 2 cycles — and is set to !inhibit at
+                // 29830 (so suppression clears it there). The IRQ *line* is only pulled when !inhibit.
+                case 29828: apu_fcIrqFlag = true; break
+                case 29829:
+                    apuClockQF(); apuClockHF(); apuSnapNow()
+                    apu_fcIrqFlag = true
+                    if (!apu_fcInhibitIrq) cpu_irqLevel = true
+                    break
+                case 29830:
+                    apu_fcIrqFlag = !apu_fcInhibitIrq
+                    if (!apu_fcInhibitIrq) cpu_irqLevel = true
+                    apu_fcCycles = 0
+                    break
+            }
+        } else {
+            // 5-step: QF at 7457/14913/22371/37281, HF at 14913/37281, no frame IRQ.
+            switch (apu_fcCycles) {
+                case 7457:  apuClockQF(); apuSnapNow(); break
+                case 14913: apuClockQF(); apuClockHF(); apuSnapNow(); break
+                case 22371: apuClockQF(); apuSnapNow(); break
+                case 37281: apuClockQF(); apuClockHF(); apuSnapNow(); break
+                case 37282: apu_fcCycles = 0; break
+            }
+        }
+
+        apu_putCycle = !apu_putCycle
+        apu_fcAbs++
+    }
+}
+
+// Catch the frame counter up to the cycle of the MMIO access currently being serviced.
+// The CPU access at cycle Q observes APU state as of the end of cycle Q-1 (the APU's own step for
+// cycle Q runs after the CPU access within that cycle), so the target is instrStart + instrCycle - 1.
+function apuFCToAccess() { apuRunFC(cpu_totalCycles + cpu_instrCycle - 1) }
+
 // Step the APU by `cycles` CPU cycles.  Returns any extra CPU stall cycles from DMC DMA.
 function stepAPU(cycles) {
     let extra = 0
-
-    // ── Frame counter ──
-    if (apu_fcResetDelay > 0) {
-        apu_fcResetDelay -= cycles
-        if (apu_fcResetDelay <= 0) { apu_fcCycles = 0; apu_fcResetDelay = 0 }
-    } else {
-        let prev = apu_fcCycles
-        apu_fcCycles += cycles
-        let fc = apu_fcCycles
-
-        if (apu_fcMode == 0) {
-            // 4-step mode — snapshot AFTER each clock event so length counters reflect HF
-            if (prev < 7457  && fc >= 7457)  { apuClockQF(); apuSnapNow() }
-            if (prev < 14913 && fc >= 14913) { apuClockQF(); apuClockHF(); apuSnapNow() }
-            if (prev < 22371 && fc >= 22371) { apuClockQF(); apuSnapNow() }
-            if (prev < 29829 && fc >= 29829) {
-                if (!apu_fcInhibitIrq) { apu_fcIrqFlag = true; cpu_irqLevel = true }
-            }
-            if (prev < 29830 && fc >= 29830) {
-                apuClockQF(); apuClockHF(); apuSnapNow()
-                if (!apu_fcInhibitIrq) { apu_fcIrqFlag = true; cpu_irqLevel = true }
-                apu_fcCycles -= 29830
-            }
-        } else {
-            // 5-step mode
-            if (prev < 7457  && fc >= 7457)  { apuClockQF(); apuSnapNow() }
-            if (prev < 14913 && fc >= 14913) { apuClockQF(); apuClockHF(); apuSnapNow() }
-            if (prev < 22371 && fc >= 22371) { apuClockQF(); apuSnapNow() }
-            // No event at 29829 in 5-step
-            if (prev < 37281 && fc >= 37281) { apuClockQF(); apuClockHF(); apuSnapNow() }
-            if (fc >= 37282) { apu_fcCycles -= 37282 }
-        }
-    }
 
     // ── DMC timer and bit-clock ──
     if (apu_dmcEnable || apu_dmcBytesRem > 0) {
@@ -2024,15 +2084,21 @@ function run() {
             prof_cpu_cycles += skipCyc
             prof_cpu_skip   += skipCyc
             if (config.audioEnable) stepAPU(skipCyc)  // keep APU ticking during spin-loops
+            apuRunFC(cpu_totalCycles)                  // cycle-accurate frame counter (always runs)
             if (mapperId == 69) fme7ClockIRQ(skipCyc)
             else if (mapperId == 24 || mapperId == 26) vrc6ClockIRQ(skipCyc)
         } else {
             lastPC = cpu_pc
             emulateCPU()
+            if (apu_oamDmaStall) {  // OAM DMA stall (deferred from the $4014 write; see apu_oamDmaStall)
+                cycles += apu_oamDmaStall; cpu_totalCycles += apu_oamDmaStall
+                prof_cpu_cycles += apu_oamDmaStall; apu_oamDmaStall = 0
+            }
             if (config.audioEnable) {
                 let extra = stepAPU(cycles)
                 if (extra) { cycles += extra; cpu_totalCycles += extra; prof_cpu_cycles += extra }
             }
+            apuRunFC(cpu_totalCycles)  // advance frame counter to the instruction boundary
             if (mapperId == 69) fme7ClockIRQ(cycles)
             else if (mapperId == 24 || mapperId == 26) vrc6ClockIRQ(cycles)
             ppuBudget += cycles * 3
@@ -2294,6 +2360,8 @@ function emulateCPU() {
             cpu_pc = (pc + 1) & 0xFFFF
         }
     }
+
+    cpu_instrCycle = 1   // opcode fetch consumed cycle 1; readPC/read/write count the rest
 
     prof_cpu_instrs++
     prof_opcodeHits[opcode]++
