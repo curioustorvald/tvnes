@@ -20,6 +20,8 @@ config.printTracelog = false
 config.audioEnable = true
 config.audioVolume = 255  // 0–255; passed to audio.setMasterVolume for both playheads
 
+const PLAYHEAD = audio.getFreePlayhead(0)
+
 // ── LibPSG (PSG synthesiser for NES PSG channels → Audio Adapter Playhead 0) ──
 const psg = require("psg")
 
@@ -42,6 +44,12 @@ let cpu_fC = false, cpu_fZ = false, cpu_fN = false, cpu_fV = false, cpu_fI = fal
 let cpu_halted = false
 let cpu_nmiLevel = false, cpu_doNMI = false, cpu_nmiFired = 0
 let cpu_irqLevel = false, cpu_doIRQ = false  // level-triggered IRQ (MMC3)
+// IRQ delivery timing: the 6502 polls interrupts before an instruction's final cycle and services
+// the IRQ after that instruction, so recognition lags the line by ~1 instruction. cpu_irqArmed =
+// "the previous instruction's poll saw the line low & I clear → the next instruction is an IRQ".
+// cpu_iChangeDelayed = the just-executed op was CLI/SEI/PLP, whose I-flag change happens *after*
+// the poll (so that poll must use the pre-instruction I flag).
+let cpu_irqArmed = false, cpu_iChangeDelayed = false
 let cpu_totalCycles = 0
 let cpu_instrCycle = 0   // CPU cycle offset within the current instruction (1 = opcode fetch); lets MMIO accesses know their exact cycle for cycle-accurate APU frame-counter catch-up
 // ── Hot PPU/loop flags hoisted out of e (read every CPU instruction or every scanline) ──
@@ -2068,8 +2076,8 @@ function run() {
         cpu_nmiLevel = ppu_enableNMI && ppu_vblank
         if (!prevNMI && cpu_nmiLevel) cpu_doNMI = true
 
-        // IRQ level detection (MMC3 and future mappers); only raises when I flag is clear
-        if (cpu_irqLevel && !cpu_fI && !cpu_doNMI && !cpu_doIRQ) cpu_doIRQ = true
+        // Deliver an IRQ recognised by the previous instruction's interrupt poll (see cpu_irqArmed).
+        if (cpu_irqArmed && !cpu_doNMI && !cpu_doIRQ) cpu_doIRQ = true
 
         // Spin-loop fast-forward: when the CPU is stuck at the same PC (JMP-to-self)
         // and no NMI or IRQ is pending, skip the remaining PPU budget to the next scanline
@@ -2087,7 +2095,9 @@ function run() {
             apuRunFC(cpu_totalCycles)                  // cycle-accurate frame counter (always runs)
             if (mapperId == 69) fme7ClockIRQ(skipCyc)
             else if (mapperId == 24 || mapperId == 26) vrc6ClockIRQ(skipCyc)
+            cpu_irqArmed = cpu_irqLevel && !cpu_fI     // spin polls every iteration
         } else {
+            let iBefore = cpu_fI   // I flag before this instruction (CLI/SEI/PLP change it on the final cycle, after the poll)
             lastPC = cpu_pc
             emulateCPU()
             if (apu_oamDmaStall) {  // OAM DMA stall (deferred from the $4014 write; see apu_oamDmaStall)
@@ -2098,10 +2108,18 @@ function run() {
                 let extra = stepAPU(cycles)
                 if (extra) { cycles += extra; cpu_totalCycles += extra; prof_cpu_cycles += extra }
             }
-            apuRunFC(cpu_totalCycles)  // advance frame counter to the instruction boundary
+            // The 6502 polls interrupts just before an instruction's final cycle, so sample the IRQ
+            // line at the penultimate cycle (a line pulled on the final cycle isn't seen until the
+            // next instruction). With cycle-accurate apuRunFC this resolves the 1-cycle N-vs-O case.
+            apuRunFC(cpu_totalCycles - 1)
+            let irqAtPoll = cpu_irqLevel
+            apuRunFC(cpu_totalCycles)
             if (mapperId == 69) fme7ClockIRQ(cycles)
             else if (mapperId == 24 || mapperId == 26) vrc6ClockIRQ(cycles)
             ppuBudget += cycles * 3
+            // Arm an IRQ for the next instruction. CLI/SEI/PLP change the I flag after this poll,
+            // so use their pre-instruction I flag; all other instructions use the post value.
+            cpu_irqArmed = irqAtPoll && !(cpu_iChangeDelayed ? iBefore : cpu_fI)
         }
 
         if (ppuBudget >= 341) {
@@ -2362,6 +2380,7 @@ function emulateCPU() {
     }
 
     cpu_instrCycle = 1   // opcode fetch consumed cycle 1; readPC/read/write count the rest
+    cpu_iChangeDelayed = false  // set by CLI/SEI/PLP below (delayed-I-flag interrupt poll)
 
     prof_cpu_instrs++
     prof_opcodeHits[opcode]++
@@ -2430,7 +2449,7 @@ function emulateCPU() {
         case 0x2E: { temp = readPCu16(); let v=read(temp); write(temp,v); write(temp, doROL(v)); cycles = 6; break }
         case 0x3E: { temp = addrAbsXW(); let v=read(temp); write(temp,v); write(temp, doROL(v)); cycles = 7; break }
 
-        case 0x28: unpackFlags(pull()); cycles = 4; break  // PLP
+        case 0x28: unpackFlags(pull()); cpu_iChangeDelayed = true; cycles = 4; break  // PLP
         case 0x30: doBranchingOnPredicate(cpu_fN);  break  // BMI
         case 0x38: cpu_fC = true;  cycles = 2; break      // SEC
 
@@ -2459,7 +2478,7 @@ function emulateCPU() {
         case 0x6C: cpu_pc = readU16Wrap(readPCu16()); cycles = 5; break  // JMP indirect
 
         case 0x50: doBranchingOnPredicate(!cpu_fV); break  // BVC
-        case 0x58: cpu_fI = false; cycles = 2;  break  // CLI
+        case 0x58: cpu_fI = false; cpu_iChangeDelayed = true; cycles = 2;  break  // CLI
 
         // RTS
         case 0x60: cpu_pc = pullu16() + 1; cycles = 6; break
@@ -2483,7 +2502,7 @@ function emulateCPU() {
 
         case 0x68: cpu_a = pull(); cpu_fZ = cpu_a==0; cpu_fN = cpu_a>127; cycles = 4; break  // PLA
         case 0x70: doBranchingOnPredicate(cpu_fV); break  // BVS
-        case 0x78: cpu_fI = true; cycles = 2; break    // SEI
+        case 0x78: cpu_fI = true; cpu_iChangeDelayed = true; cycles = 2; break    // SEI
 
         // STA
         case 0x81: write(addrIndX(), cpu_a); cycles = 6; break
@@ -3282,12 +3301,12 @@ function apuBootAudio() {
     // JS-side scratch for mix; no need to go through sys.malloc/poke for this step
     apu_sumBuf = new Uint8Array(1200)
     // Initialise playhead 0 (PSG+DMC are mixed into a single stream here)
-    audio.resetParams(0)
-    audio.purgeQueue(0)
-    audio.setPcmMode(0)
-    audio.setMasterVolume(0, config.audioVolume)
-    audio.setPcmQueueCapacityIndex(0, 3)  // capacity index 3 → 12 chunks ≈ 200ms jitter
-    audio.play(0)
+    audio.resetParams(PLAYHEAD)
+    audio.purgeQueue(PLAYHEAD)
+    audio.setPcmMode(PLAYHEAD)
+    audio.setMasterVolume(PLAYHEAD, config.audioVolume)
+    audio.setPcmQueueCapacityIndex(PLAYHEAD, 3)  // capacity index 3 → 12 chunks ≈ 200ms jitter
+    audio.play(PLAYHEAD)
     apuAudioBooted = true
 }
 
@@ -3357,9 +3376,9 @@ function emitAudioFrame() {
         sumBuf[2*i+1] = (psgR[j] + dmcBuf[2*i+1]) >>> 1
     }
     sys.pokeBytes(apuSumStagingPtr, sumBuf.subarray(0, dmcBytes), dmcBytes)
-    audio.putPcmDataByPtr(0, apuSumStagingPtr, dmcBytes, 0)
-    audio.setSampleUploadLength(0, dmcBytes)
-    audio.startSampleUpload(0)
+    audio.putPcmDataByPtr(PLAYHEAD, apuSumStagingPtr, dmcBytes, 0)
+    audio.setSampleUploadLength(PLAYHEAD, dmcBytes)
+    audio.startSampleUpload(PLAYHEAD)
 
     // ── Reset for next frame ──
     apu_absTimeSec += totalSamples / SR  // integer-aligned so frame boundary is also gapless
@@ -3538,7 +3557,7 @@ if (traceFile) traceFile.flush()
 // ── Audio adapter teardown ──
 if (config.audioEnable && apuAudioBooted) {
     try {
-        audio.stop(0); audio.purgeQueue(0)
+        audio.stop(PLAYHEAD); audio.purgeQueue(PLAYHEAD)
         sys.free(apuSumStagingPtr)
         // libPsgBuf and apu_sumBuf are JS-backed; GC handles them
     } catch (_) { /* teardown must not abort cleanup */ }
